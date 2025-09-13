@@ -22,11 +22,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制应用代码
 COPY main.py .
 
-# 创建非root用户
-RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
-USER app
-
 # 暴露端口
 EXPOSE 3280
 
