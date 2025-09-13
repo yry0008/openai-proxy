@@ -11,10 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # 安装系统依赖
-RUN apt-get update && apt-get install -y \
-    --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache gcc musl-dev libffi-dev
 
 # 复制依赖文件
 COPY requirements.txt .
