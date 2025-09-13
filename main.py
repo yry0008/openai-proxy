@@ -17,7 +17,7 @@ dotenv.load_dotenv()
 
 
 
-TARGET_SERVER = os.getenv("TARGET_SERVER", "http://100.90.220.3:2100")
+TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4")
 API_KEY = os.getenv("API_KEY", "your_api_key_here")
 parsed_target = urlparse(TARGET_SERVER)
