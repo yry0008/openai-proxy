@@ -9,6 +9,8 @@ from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect  # 新增依赖
 
+import asyncio
+
 import logging
 logging.basicConfig(level=logging.INFO)
 
@@ -99,8 +101,20 @@ async def websocket_proxy(websocket: WebSocket, path: str):
     return await pass_ws_request(websocket, path)
 
 
-async def stream_generator(response: aiohttp.ClientResponse):
+async def _check_client_disconnected(response: aiohttp.ClientResponse, raw_request: Request) -> None:
+        """检查客户端是否断开连接"""
+        while response.closed is False:
+            if await raw_request.is_disconnected():
+                logging.warning("Client disconnected, stopping stream")
+                response.close()
+                return
+            await asyncio.sleep(1)  # 每秒检查一次
+        return
+
+
+async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request):
     try:
+        task = asyncio.create_task(_check_client_disconnected(response, raw_request))
         async for chunk in response.content:
             logging.debug(f"Received chunk: {chunk}")
             if chunk:
@@ -110,8 +124,11 @@ async def stream_generator(response: aiohttp.ClientResponse):
         logging.error(traceback.format_exc())
         # 在流式传输过程中如果连接断开，优雅地结束
         logging.error(f"Stream connection error: {e}")
+        response.release()
+        task.cancel()
         return
     finally:
+        task.cancel()
         response.release()
 
 
@@ -179,7 +196,7 @@ async def reverse_proxy(request: Request, path: str):
             response.raise_for_status()
             # 流式响应
             return StreamingResponse(
-                stream_generator(response),
+                stream_generator(response,request),
                 media_type='text/event-stream'
             )
         else:
