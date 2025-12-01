@@ -12,7 +12,7 @@ from websockets import connect as websocket_connect  # 新增依赖
 import asyncio
 
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 import dotenv
 dotenv.load_dotenv()
@@ -139,7 +139,7 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def reverse_proxy(request: Request, path: str):
     global client_session
     # 构建目标URL
-    target_url = urljoin(TARGET_SERVER, path)
+    target_url = TARGET_SERVER.rstrip('/') + '/' + path.lstrip('/')
     # 保留原始查询参数
     if request.url.query:
         target_url += f"?{request.url.query}"
@@ -168,7 +168,7 @@ async def reverse_proxy(request: Request, path: str):
         del headers["host"]
     
     # 设置目标服务器信息
-    headers["host"] = TARGET_HOST
+    headers["host"] = TARGET_HOST.split('/')[0].split(':')[0]
     
     # 替换Authorization头为API_KEY
     headers["authorization"] = f"Bearer {API_KEY}"
