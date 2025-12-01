@@ -12,7 +12,7 @@ from websockets import connect as websocket_connect  # 新增依赖
 import asyncio
 
 import logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 import dotenv
 dotenv.load_dotenv()
