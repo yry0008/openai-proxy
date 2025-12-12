@@ -173,7 +173,7 @@ async def auto_disconnect_connection(raw_request: Request, upstream_request_id: 
         while True:
             await asyncio.sleep(1)
             if await raw_request.is_disconnected():
-                logger.warning(f"Client disconnected, cancelling upstream request {upstream_request_id}")
+                logger.debug(f"Client disconnected, cancelling upstream request {upstream_request_id} if active.")
                 await proxy_client.cancel_request(
                     upstream_request_id,
                 )
