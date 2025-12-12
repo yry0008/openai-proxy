@@ -75,6 +75,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.exception_handler(HttpErrorWithContent)
+async def upstream_http_exception_handler(request: Request, exc: HttpErrorWithContent):
+    """
+    全局异常捕获：将 AsyncHttpClient 抛出的上游错误转为对应的 HTTP 响应
+    """
+    logger.warning(f"⚠️ Upstream Error {exc.status_code}: {len(exc.content)} bytes")
+    return Response(
+        content=exc.content,
+        status_code=exc.status_code,
+        media_type="application/json"
+    )
+
 async def pass_ws_request(websocket: WebSocket, path: str):
 
     # 接受客户端连接
@@ -151,7 +163,7 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
         response.release()
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(req:dict,request: Request):
     try:
         target_url = TARGET_SERVER.rstrip('/') + '/' + request.url.path.lstrip('/')
         body_bytes = await request.body()
