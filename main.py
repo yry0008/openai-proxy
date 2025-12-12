@@ -186,6 +186,10 @@ async def chat_completions(req:dict,request: Request):
             if 'continuous_usage_stats' in body['stream_options']:      
                 del body['stream_options']['continuous_usage_stats']
 
+        if client_wants_stream:
+            on_stream_start_callback = on_first_chunk_callback
+        else:
+            on_stream_start_callback = None
         req_wrapper = RequestWrapper(
             url=target_url,
             method="POST",
@@ -200,7 +204,7 @@ async def chat_completions(req:dict,request: Request):
             timeout=REQUEST_TIMEOUT,
             retry_interval=RETRY_INTERVAL,
             max_retries=MAX_RETRIES,
-            on_stream_start=on_first_chunk_callback,
+            on_stream_start=on_stream_start_callback,
         )
 
         # 1. 提交任务
