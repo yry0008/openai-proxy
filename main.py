@@ -16,7 +16,7 @@ import orjson
 import asyncio
 
 import logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import dotenv
 dotenv.load_dotenv()

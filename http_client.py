@@ -14,7 +14,7 @@ import orjson
 # PART 1: AsyncHttpClient 实现 (复制自上一轮最终版本)
 # ==========================================
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- 类型定义 ---

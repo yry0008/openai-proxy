@@ -2,7 +2,7 @@ import asyncio
 from typing import Dict, Any, Optional, Union, Callable, Awaitable, AsyncGenerator
 from http_client import AsyncHttpClient, HttpErrorWithContent, RequestWrapper, RequestResult, RequestStatus, CancelBehavior
 import logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class SseProxyClient(AsyncHttpClient):
