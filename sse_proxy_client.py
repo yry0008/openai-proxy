@@ -16,7 +16,6 @@ class SseProxyClient(AsyncHttpClient):
                 chunk = await asyncio.wait_for(asyncio.shield(next_item_task), timeout=heartbeat_interval)
                 yield chunk
                 next_item_task = asyncio.create_task(iterator.__anext__())
-
             except asyncio.TimeoutError:
                 ctx = self.active_requests.get(request_id)
                 if next_item_task.done():
@@ -32,11 +31,8 @@ class SseProxyClient(AsyncHttpClient):
                         except Exception: pass
                         break
                     yield heartbeat_content
-
             except StopAsyncIteration: break
             except HttpErrorWithContent: raise
             except Exception as e:
                 logger.error(f"Stream error: {e}")
                 raise e
-
-

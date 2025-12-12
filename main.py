@@ -32,7 +32,7 @@ TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSock
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
 HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", 5.0))
-RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 3.0))
+RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 
 client_session: aiohttp.ClientSession = None
@@ -162,6 +162,9 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
         task.cancel()
         response.release()
 
+async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
+    logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req:dict,request: Request):
     try:
@@ -196,7 +199,8 @@ async def chat_completions(req:dict,request: Request):
             retry_on_stream_error=False,
             timeout=REQUEST_TIMEOUT,
             retry_interval=RETRY_INTERVAL,
-            max_retries=MAX_RETRIES
+            max_retries=MAX_RETRIES,
+            on_stream_start=on_first_chunk_callback,
         )
 
         # 1. 提交任务

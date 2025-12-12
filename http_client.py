@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, Union, Callable, Awaitable, AsyncGenerat
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
+import time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import orjson
 
@@ -16,6 +17,7 @@ import orjson
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- 类型定义 ---
 class CancelBehavior(Enum):
     DO_NOTHING = 0
     TRIGGER_SUCCESS = 1
@@ -36,6 +38,8 @@ class RequestResult:
     http_code: Optional[int] = None
     error: Optional[Exception] = None
 
+# 回调函数签名
+OnStreamStartCallback = Callable[[str, float, Any], Union[None, Awaitable[None]]]
 CallbackType = Callable[['RequestResult', Any], Union[None, Awaitable[None]]]
 
 @dataclass
@@ -46,7 +50,13 @@ class RequestWrapper:
     headers: Optional[Dict[str, str]] = None
     data: Any = None
     json: Any = None
+    
     user_data: Any = None 
+    
+    # 回调配置
+    on_stream_start: Optional[OnStreamStartCallback] = None
+    stream_start_data: Any = None 
+
     keep_content_in_memory: bool = True 
     max_retries: int = 0
     retry_interval: float = 1.0
@@ -63,7 +73,7 @@ class HttpErrorWithContent(Exception):
     def __init__(self, status_code, content, message):
         super().__init__(message)
         self.status_code = status_code
-        self.content = content  # bytes
+        self.content = content
 
 class RequestContext:
     def __init__(self, request_id: str, wrapper: RequestWrapper):
@@ -74,7 +84,7 @@ class RequestContext:
         self.created_at = datetime.now()
         self.stream_queue: Optional[asyncio.Queue] = asyncio.Queue(maxsize=1000) if wrapper.is_stream else None
         self.sentinel = object()
-        # 【新增】用于同步等待上游连接建立结果的 Future
+        # 用于 server.py 等待连接建立结果
         self.startup_future: asyncio.Future = asyncio.Future()
 
 class AsyncHttpClient:
@@ -98,18 +108,10 @@ class AsyncHttpClient:
         self.active_requests[req_id] = ctx
         return req_id
 
-    # 【新增】供外部调用的等待方法
     async def wait_for_upstream_status(self, request_id: str):
-        """
-        等待上游建立连接并返回 Headers。
-        如果上游返回 >= 400，这里会直接抛出 HttpErrorWithContent。
-        """
+        """等待上游连接建立结果，如果重试中，这里会一直挂起，直到重试成功或彻底失败"""
         ctx = self.active_requests.get(request_id)
-        if not ctx:
-            raise ValueError("Invalid Request ID")
-        
-        # 等待 Future 结果
-        # 如果 _worker 设置了 set_exception，这里会抛出异常
+        if not ctx: raise ValueError("Invalid Request ID")
         await ctx.startup_future
 
     async def _worker(self, ctx: RequestContext):
@@ -139,37 +141,44 @@ class AsyncHttpClient:
             accumulated_body = bytearray()
             last_http_code, last_error = None, None
             stream_started_successfully = False
+            start_time = time.perf_counter()
 
             try:
-                # 建立连接阶段
+                if attempt > 1:
+                    logger.info(f"🔄 Retry attempt {attempt}/{total_attempts} for {ctx.request_id}")
+
                 async with session.request(req.method, req.url, **request_kwargs) as response:
                     last_http_code = response.status
                     
-                    # --- 1. 错误状态处理 ---
+                    # --- 1. 错误状态码处理 ---
                     if response.status >= 400:
                         try:
                             error_bytes = await response.read()
                             if req.keep_content_in_memory: accumulated_body.extend(error_bytes)
-                        except: 
-                            error_bytes = b""
+                        except: error_bytes = b""
                         
                         exc = HttpErrorWithContent(response.status, error_bytes, f"HTTP {response.status}")
                         
-                        # 【关键】立即通知等待者：启动失败
-                        if not ctx.startup_future.done():
-                            ctx.startup_future.set_exception(exc)
-                        
+                        # 【修复点 1】: 不要在这里 set_exception。
+                        # 如果设置了，server.py 会立即收到错误并停止等待，导致重试无效。
+                        # 我们只抛出异常，让下面的 except 块处理重试逻辑。
                         raise exc
 
-                    # --- 2. 成功建立连接 ---
-                    # 【关键】通知等待者：启动成功
+                    # --- 2. 连接成功 (200 OK) ---
+                    # 只有在这里成功了，才通知 Future 成功
                     if not ctx.startup_future.done():
                         ctx.startup_future.set_result(response.status)
 
-                    # --- 3. 处理 Body ---
                     if req.is_stream:
                         stream_started_successfully = True
+                        is_first_chunk = True
                         async for chunk in response.content.iter_any():
+                            # 首字回调
+                            if is_first_chunk:
+                                ttft = time.perf_counter() - start_time
+                                self._trigger_stream_start_callback(req.on_stream_start, ctx.request_id, ttft, req.stream_start_data)
+                                is_first_chunk = False
+
                             await ctx.stream_queue.put(chunk)
                             if req.keep_content_in_memory: accumulated_body.extend(chunk)
                         await ctx.stream_queue.put(ctx.sentinel)
@@ -189,9 +198,8 @@ class AsyncHttpClient:
                 partial = self._prepare_content(accumulated_body, req.keep_content_in_memory)
                 if req.is_stream: await ctx.stream_queue.put(e)
                 
-                # 如果还没启动完成就取消了，通知等待者
-                if not ctx.startup_future.done():
-                    ctx.startup_future.set_exception(e)
+                # 取消是不可恢复的，必须立即通知 Future
+                if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
 
                 res = RequestResult(ctx.request_id, RequestStatus.CANCELLED, partial, last_http_code, e)
                 if req.cancel_behavior == CancelBehavior.TRIGGER_SUCCESS: self._trigger_callback(req.on_success, res, req.user_data)
@@ -202,21 +210,22 @@ class AsyncHttpClient:
                 last_error = e
                 if isinstance(e, HttpErrorWithContent): last_http_code = e.status_code
                 
-                # 如果是在启动阶段出错，且不是重试的中间过程，应该通知 Future
-                # 注意：如果是第一次尝试失败，我们可能希望等重试？ 
-                # 这里策略简化：如果本次尝试失败，我们暂不 set_exception，除非是最后一次尝试
-                # 或者：我们可以让 submit 调用者等待直到第一次成功或者彻底失败。
-                
-                if req.is_stream and stream_started_successfully and not req.retry_on_stream_error: 
-                    # 流中断，不重试，通知失败
+                # 特殊情况：流已经开始但不允许流错误重试 -> 立即失败
+                if req.is_stream and stream_started_successfully and not req.retry_on_stream_error:
+                    logger.warning(f"Stream interrupted, no retry: {e}")
+                    # 【修复点 2】: 决定不再重试了，才通知 Future 失败
                     if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                     break 
                 
+                # 检查重试次数
                 if attempt < total_attempts:
+                    logger.warning(f"Attempt {attempt} failed: {e}. Retrying in {req.retry_interval}s...")
+                    # 正在重试中... Future 保持 Pending 状态，server.py 继续等待
                     await asyncio.sleep(req.retry_interval)
                     continue 
                 else: 
-                    # 彻底失败，通知 Future
+                    # 【修复点 3】: 重试次数耗尽，彻底失败，通知 Future
+                    logger.error(f"All attempts failed: {e}")
                     if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                     break
         
@@ -225,7 +234,7 @@ class AsyncHttpClient:
             error_to_propagate = last_error if last_error else Exception("Unknown Error in Worker")
             await ctx.stream_queue.put(error_to_propagate)
 
-        # 兜底：如果循环结束 Future 还没设置（极少见），设为失败
+        # 兜底
         if not ctx.startup_future.done():
             ctx.startup_future.set_exception(last_error or Exception("Worker Failed"))
 
@@ -236,6 +245,15 @@ class AsyncHttpClient:
         if not keep_memory: return "[Content Dropped]"
         try: return data.decode('utf-8')
         except: return bytes(data)
+
+    def _trigger_stream_start_callback(self, callback: OnStreamStartCallback, req_id: str, ttft: float, custom_data: Any):
+        if not callback: return
+        if asyncio.iscoroutinefunction(callback): asyncio.create_task(callback(req_id, ttft, custom_data))
+        else: asyncio.get_running_loop().run_in_executor(None, self._run_sync_stream_start_callback, callback, req_id, ttft, custom_data)
+
+    def _run_sync_stream_start_callback(self, callback, req_id, ttft, custom_data):
+        try: callback(req_id, ttft, custom_data)
+        except Exception: pass
 
     def _trigger_callback(self, callback: CallbackType, result: RequestResult, user_data: Any):
         if not callback: return
