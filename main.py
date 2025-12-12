@@ -30,10 +30,10 @@ parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
 
-REQUEST_TIMEOUT = 30
-HEARTBEAT_INTERVAL = 5.0
-RETRY_INTERVAL = 3.0
-MAX_RETRIES = 5
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
+HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", 5.0))
+RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 3.0))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 
 client_session: aiohttp.ClientSession = None
 
