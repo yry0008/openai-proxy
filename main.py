@@ -165,6 +165,22 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
+async def auto_disconnect_connection(raw_request: Request, upstream_request_id: str):
+    """
+    自动断开连接的协程
+    """
+    try:
+        while True:
+            await asyncio.sleep(1)
+            if await raw_request.is_disconnected():
+                logger.warning(f"Client disconnected, cancelling upstream request {upstream_request_id}")
+                await proxy_client.cancel_request(
+                    upstream_request_id,
+                )
+                return
+    except asyncio.CancelledError:
+        return
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req:dict,request: Request):
     try:
@@ -210,6 +226,8 @@ async def chat_completions(req:dict,request: Request):
         # 1. 提交任务
         req_id = proxy_client.submit(req_wrapper)
         logger.info(f"Forwarding request {req_id} (Stream: {client_wants_stream})")
+
+        asyncio.create_task(auto_disconnect_connection(request, req_id))
 
         # 2. 【关键修复】同步等待上游连接建立结果
         # 如果上游返回 401/400/500，这里会直接抛出 HttpErrorWithContent
