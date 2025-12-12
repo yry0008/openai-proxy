@@ -1,7 +1,4 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, status
-from fastapi.responses import Response, StreamingResponse
-from fastapi.websockets import WebSocket
 import aiohttp
 import os
 import json
@@ -9,24 +6,38 @@ from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect  # 新增依赖
 
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import Response, StreamingResponse, ORJSONResponse
+from fastapi.websockets import WebSocket
+from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent
+from sse_proxy_client import SseProxyClient
+import orjson
+
 import asyncio
 
 import logging
-logging.basicConfig(level=logging.INFO)
-
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 import dotenv
 dotenv.load_dotenv()
 
 
 
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4")
+MODEL_NAME = os.getenv("MODEL_NAME", "")
 API_KEY = os.getenv("API_KEY", "your_api_key_here")
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
 
+REQUEST_TIMEOUT = 30
+HEARTBEAT_INTERVAL = 5.0
+RETRY_INTERVAL = 3.0
+MAX_RETRIES = 5
+
 client_session: aiohttp.ClientSession = None
+
+proxy_client: SseProxyClient = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,17 +51,25 @@ async def startup():
     应用启动时，创建 aiohttp.ClientSession 实例。
     """
     global client_session
-    print("Starting up and creating aiohttp.ClientSession...")
+    global proxy_client
+    logger.info("Starting up and creating aiohttp.ClientSession...")
     client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
+    proxy_client = SseProxyClient()
+    logger.info("SseProxyClient started.")
 
 async def shutdown():
     """
     应用关闭时，优雅地关闭 aiohttp.ClientSession。
     """
     global client_session
+    global proxy_client
     if client_session:
-        print("Shutting down aiohttp.ClientSession...")
+        logger.info("Shutting down aiohttp.ClientSession...")
         await client_session.close()
+    if proxy_client:
+        logger.info("Shutting down SseProxyClient...")
+        await proxy_client.close()
+
 
 app = FastAPI(
     lifespan=lifespan,
@@ -105,7 +124,7 @@ async def _check_client_disconnected(response: aiohttp.ClientResponse, raw_reque
         """检查客户端是否断开连接"""
         while response.closed is False:
             if await raw_request.is_disconnected():
-                logging.warning("Client disconnected, stopping stream")
+                logger.warning("Client disconnected, stopping stream")
                 response.close()
                 return
             await asyncio.sleep(1)  # 每秒检查一次
@@ -116,20 +135,96 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
     try:
         task = asyncio.create_task(_check_client_disconnected(response, raw_request))
         async for chunk in response.content:
-            logging.debug(f"Received chunk: {chunk}")
+            logger.debug(f"Received chunk: {chunk}")
             if chunk:
                 yield chunk
     except (aiohttp.ClientError, ConnectionError, Exception) as e:
         import traceback
-        logging.error(traceback.format_exc())
+        logger.error(traceback.format_exc())
         # 在流式传输过程中如果连接断开，优雅地结束
-        logging.error(f"Stream connection error: {e}")
+        logger.error(f"Stream connection error: {e}")
         response.release()
         task.cancel()
         return
     finally:
         task.cancel()
         response.release()
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    try:
+        target_url = TARGET_SERVER.rstrip('/') + '/' + request.url.path.lstrip('/')
+        body_bytes = await request.body()
+        try:
+            body = orjson.loads(body_bytes)
+        except orjson.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+        auth_header = "Bearer " + API_KEY
+
+        client_wants_stream = body.get("stream", False)
+        body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
+        if body.get("model") is None or body.get("model") == "":
+            raise HTTPException(status_code=400, detail="Model name is required but not provided.")
+        
+        if 'stream_options' in body:                     
+            if 'continuous_usage_stats' in body['stream_options']:      
+                del body['stream_options']['continuous_usage_stats']
+
+        req_wrapper = RequestWrapper(
+            url=target_url,
+            method="POST",
+            headers={
+                "Authorization": auth_header,
+                "Content-Type": "application/json"
+            },
+            json=body,
+            is_stream=True, 
+            keep_content_in_memory=False, 
+            retry_on_stream_error=False,
+            timeout=REQUEST_TIMEOUT,
+            retry_interval=RETRY_INTERVAL,
+            max_retries=MAX_RETRIES
+        )
+
+        # 1. 提交任务
+        req_id = proxy_client.submit(req_wrapper)
+        logger.info(f"Forwarding request {req_id} (Stream: {client_wants_stream})")
+
+        # 2. 【关键修复】同步等待上游连接建立结果
+        # 如果上游返回 401/400/500，这里会直接抛出 HttpErrorWithContent
+        # 然后被 @app.exception_handler 捕获，返回正确的错误码给客户端
+        await proxy_client.wait_for_upstream_status(req_id)
+
+        # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
+        if client_wants_stream:
+            return StreamingResponse(
+                proxy_client.stream_generator(
+                    req_id 
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        else:
+            async def collect_response():
+                chunks = []
+                async for chunk in proxy_client.stream_generator(req_id):
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            
+            full_body = await collect_response()
+            return Response(content=full_body, media_type="application/json")
+
+    except HttpErrorWithContent:
+        # 显式抛出以触发 handler
+        raise
+    except Exception as e:
+        logger.error(f"Proxy Internal Error: {str(e)}")
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.api_route("/{path:path}", methods=[
