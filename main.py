@@ -9,7 +9,7 @@ from websockets import connect as websocket_connect  # 新增依赖
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
-from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent
+from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
 import orjson
 
@@ -31,7 +31,6 @@ TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
-HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", 5.0))
 RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 
@@ -165,6 +164,12 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
+async def on_request_complete_callback(result:RequestResult,data):
+    logger.info(f"Request {result.request_id} completed with status {result.status}.")
+
+async def on_request_error_callback(result:RequestResult,data):
+    logger.error(f"Request {result.request_id} failed with error: {str(result.error)}.")
+
 async def auto_disconnect_connection(raw_request: Request, upstream_request_id: str):
     """
     自动断开连接的协程
@@ -221,6 +226,9 @@ async def chat_completions(req:dict,request: Request):
             retry_interval=RETRY_INTERVAL,
             max_retries=MAX_RETRIES,
             on_stream_start=on_stream_start_callback,
+            on_success=on_request_complete_callback,
+            on_failure=on_request_error_callback,
+            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS
         )
 
         # 1. 提交任务
