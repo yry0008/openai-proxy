@@ -166,14 +166,16 @@ class AsyncHttpClient:
         ctx.status = RequestStatus.RUNNING
         session = await self.get_session()
         
+        # [FIX-3] 计算绝对截止时间
+        deadline = time.time() + req.timeout
+
         request_kwargs = {
             'params': req.params,
             'headers': req.headers or {},
-            'timeout': aiohttp.ClientTimeout(total=req.timeout),
+            # timeout 将在循环内动态更新
             **req.extra_options
         }
 
-        # orjson 优化
         if req.json is not None:
             request_kwargs['data'] = orjson.dumps(req.json)
             if 'headers' not in request_kwargs: request_kwargs['headers'] = {}
@@ -187,6 +189,15 @@ class AsyncHttpClient:
         
         try:
             for attempt in range(1, total_attempts + 1):
+                # [FIX-3] 检查剩余时间
+                remaining_time = deadline - time.time()
+                if remaining_time <= 0:
+                    last_error = asyncio.TimeoutError("Global timeout exceeded")
+                    logger.error(f"❌ Global timeout exceeded for {ctx.request_id}")
+                    break
+                
+                request_kwargs['timeout'] = aiohttp.ClientTimeout(total=remaining_time)
+
                 accumulated_body = bytearray()
                 last_http_code, last_error = None, None
                 stream_started_successfully = False
@@ -262,19 +273,15 @@ class AsyncHttpClient:
                     last_error = e
                     if isinstance(e, HttpErrorWithContent): last_http_code = e.status_code
                     
-                    # 决策：是否重试？
-                    should_retry = True
                     if req.is_stream and stream_started_successfully and not req.retry_on_stream_error:
-                        should_retry = False
+                        if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
+                        break 
                     
-                    if attempt >= total_attempts:
-                        should_retry = False
-                    
-                    if should_retry:
+                    # 检查是否还有重试机会 且 时间足够
+                    if attempt < total_attempts and (deadline - time.time() > 0):
                         await asyncio.sleep(req.retry_interval)
                         continue
                     else:
-                        # 不重试了，通知 startup_future 失败
                         if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                         break
             
@@ -327,11 +334,21 @@ class AsyncHttpClient:
     async def stream_generator(self, request_id: str) -> AsyncGenerator[bytes, None]:
         ctx = self.active_requests.get(request_id)
         if not ctx or not ctx.wrapper.is_stream: raise ValueError("Invalid ID")
-        while True:
-            data = await ctx.stream_queue.get()
-            if isinstance(data, Exception): raise data
-            if data is ctx.sentinel: break
-            yield data
+        
+        try:
+            while True:
+                data = await ctx.stream_queue.get()
+                if isinstance(data, Exception): raise data
+                if data is ctx.sentinel: break
+                yield data
+        finally:
+            # [FIX-1] 消费者断开防护：如果生成器停止但任务还在跑，说明消费者断开，必须取消任务以防死锁
+            if ctx.task and not ctx.task.done():
+                logger.warning(f"⚠️ Consumer disconnected early for {request_id}, cancelling worker.")
+                ctx.task.cancel()
+                # 让出控制权以便 loop 执行取消操作
+                try: await asyncio.sleep(0.1)
+                except: pass
 
     async def _garbage_collector(self):
         now = datetime.now()
@@ -344,5 +361,11 @@ class AsyncHttpClient:
             if key in self.active_requests: del self.active_requests[key]
 
     async def close(self):
+        # [FIX-4] 关闭时清理所有残余任务
+        logger.info("Closing AsyncHttpClient, cancelling all active requests...")
+        for _, ctx in self.active_requests.items():
+            if ctx.task and not ctx.task.done():
+                ctx.task.cancel()
+        
         if self.session: await self.session.close()
         self.scheduler.shutdown()
