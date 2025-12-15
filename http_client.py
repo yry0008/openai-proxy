@@ -363,9 +363,21 @@ class AsyncHttpClient:
     async def close(self):
         # [FIX-4] 关闭时清理所有残余任务
         logger.info("Closing AsyncHttpClient, cancelling all active requests...")
+        
+        # 1. 收集所有未完成的任务
+        pending_tasks = []
         for _, ctx in self.active_requests.items():
             if ctx.task and not ctx.task.done():
                 ctx.task.cancel()
+                pending_tasks.append(ctx.task)
         
-        if self.session: await self.session.close()
+        # 2. 等待它们优雅退出 (它们会捕获 CancelledError 并处理 finally)
+        if pending_tasks:
+            # return_exceptions=True 防止某个任务报错打断关闭流程
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        
+        # 3. 安全关闭 Session
+        if self.session: 
+            await self.session.close()
+        
         self.scheduler.shutdown()
