@@ -175,7 +175,8 @@ async def auto_disconnect_connection(raw_request: Request, upstream_request_id: 
     自动断开连接的协程
     """
     try:
-        while True:
+        # 监测客户端断开连接
+        while proxy_client.is_alive(upstream_request_id):
             await asyncio.sleep(1)
             if await raw_request.is_disconnected():
                 logger.debug(f"Client disconnected, cancelling upstream request {upstream_request_id} if active.")

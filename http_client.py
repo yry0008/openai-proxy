@@ -62,6 +62,8 @@ class RequestWrapper:
     
     # 行为配置
     keep_content_in_memory: bool = True 
+    max_memory_size: int = 100 * 1024 * 1024 # 100 MB
+
     max_retries: int = 0
     retry_interval: float = 1.0
     is_stream: bool = False
@@ -91,6 +93,10 @@ class RequestContext:
         self.finished_at: Optional[datetime] = None # 用于 TTL GC
         
         self.stream_queue: Optional[asyncio.Queue] = asyncio.Queue(maxsize=1000) if wrapper.is_stream else None
+
+        # [新增] 标记消费者是否已断开
+        self.consumer_disconnected: bool = False
+
         self.sentinel = object()
         
         # 两个 Future 用于同步状态
@@ -122,6 +128,27 @@ class AsyncHttpClient:
         ctx.task = task
         self.active_requests[req_id] = ctx
         return req_id
+    
+    def is_alive(self, request_id: str) -> bool:
+        """
+        检查请求是否依然活跃（Pending 或 Running）。
+        如果请求已完成、失败、取消或已被 GC 清理，返回 False。
+        """
+        ctx = self.active_requests.get(request_id)
+        
+        # 1. 如果上下文不存在（已被 GC 清理），则不活跃
+        if not ctx:
+            return False
+        
+        # 2. 如果任务还没创建（处于 Pending），视为活跃
+        if ctx.task is None:
+            return True
+        
+        # 3. 检查 asyncio.Task 是否完成
+        if ctx.task.done():
+            return False
+            
+        return True
 
     async def wait_for_upstream_status(self, request_id: str):
         """等待上游连接建立结果，遇到 400/500 会抛出异常"""
@@ -150,10 +177,8 @@ class AsyncHttpClient:
 
     async def json(self, request_id: str) -> Any:
         res = await self._get_final_result(request_id)
-        if res.json_body is not None:
-            return res.json_body
-        if res.content:
-            return orjson.loads(res.content)
+        if res.json_body is not None: return res.json_body
+        if res.content: return orjson.loads(res.content)
         return None
 
     def _try_parse_json(self, data: bytearray) -> Any:
@@ -165,17 +190,11 @@ class AsyncHttpClient:
         req = ctx.wrapper
         ctx.status = RequestStatus.RUNNING
         session = await self.get_session()
-        
-        # [FIX-3] 计算绝对截止时间
         deadline = time.time() + req.timeout
-
+        
         request_kwargs = {
-            'params': req.params,
-            'headers': req.headers or {},
-            # timeout 将在循环内动态更新
-            **req.extra_options
+            'params': req.params, 'headers': req.headers or {}, **req.extra_options
         }
-
         if req.json is not None:
             request_kwargs['data'] = orjson.dumps(req.json)
             if 'headers' not in request_kwargs: request_kwargs['headers'] = {}
@@ -189,7 +208,6 @@ class AsyncHttpClient:
         
         try:
             for attempt in range(1, total_attempts + 1):
-                # [FIX-3] 检查剩余时间
                 remaining_time = deadline - time.time()
                 if remaining_time <= 0:
                     last_error = asyncio.TimeoutError("Global timeout exceeded")
@@ -234,16 +252,26 @@ class AsyncHttpClient:
                                     self._trigger_stream_start_callback(req.on_stream_start, ctx.request_id, ttft, req.stream_start_data)
                                     is_first_chunk = False
 
-                                await ctx.stream_queue.put(chunk)
-                                if req.keep_content_in_memory: accumulated_body.extend(chunk)
-                            await ctx.stream_queue.put(ctx.sentinel)
+                                # [修改] 仅当消费者未断开时才 push 到队列
+                                # 如果已断开，跳过 push 以免阻塞，但继续执行下面的 accumulate 逻辑
+                                if not ctx.consumer_disconnected:
+                                    await ctx.stream_queue.put(chunk)
+                                
+                                # [修改] 即使断开，依然统计完整数据
+                                if req.keep_content_in_memory: 
+                                    accumulated_body.extend(chunk)
+                                    if len(accumulated_body) > req.max_memory_size:
+                                        raise ValueError(f"Response too large > {req.max_memory_size} bytes")
+
+                            # 流结束，放入 sentinel (仅当没断开时)
+                            if not ctx.consumer_disconnected:
+                                await ctx.stream_queue.put(ctx.sentinel)
                         else:
                             if req.keep_content_in_memory:
                                 body_bytes = await response.read()
                                 accumulated_body.extend(body_bytes)
                             else: await response.read()
 
-                        # --- 请求成功完成 ---
                         ctx.status = RequestStatus.COMPLETED
                         final_content = self._prepare_content(accumulated_body, req.keep_content_in_memory)
                         parsed_json = self._try_parse_json(accumulated_body) if req.keep_content_in_memory else None
@@ -259,7 +287,7 @@ class AsyncHttpClient:
                     partial = self._prepare_content(accumulated_body, req.keep_content_in_memory)
                     parsed_json = self._try_parse_json(accumulated_body) if req.keep_content_in_memory else None
                     
-                    if req.is_stream: await ctx.stream_queue.put(e)
+                    if req.is_stream and not ctx.consumer_disconnected: await ctx.stream_queue.put(e)
                     if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                     
                     result_obj = RequestResult(ctx.request_id, RequestStatus.CANCELLED, partial, last_http_code, e, parsed_json)
@@ -279,16 +307,17 @@ class AsyncHttpClient:
                     
                     # 检查是否还有重试机会 且 时间足够
                     if attempt < total_attempts and (deadline - time.time() > 0):
-                        await asyncio.sleep(req.retry_interval)
+                        backoff = min(req.retry_interval * (2 ** (attempt - 1)), 10.0)
+                        logger.warning(f"Retry {attempt} failed: {e}. Sleeping {backoff:.2f}s")
+                        await asyncio.sleep(backoff)
                         continue
                     else:
                         if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                         break
             
-            # --- 最终失败 ---
             ctx.status = RequestStatus.FAILED
-            if req.is_stream:
-                error_to_propagate = last_error if last_error else Exception("Unknown Error")
+            if req.is_stream and not ctx.consumer_disconnected:
+                error_to_propagate = last_error if last_error else Exception("Unknown Error in Worker")
                 await ctx.stream_queue.put(error_to_propagate)
             
             if not ctx.startup_future.done():
@@ -342,13 +371,16 @@ class AsyncHttpClient:
                 if data is ctx.sentinel: break
                 yield data
         finally:
-            # [FIX-1] 消费者断开防护：如果生成器停止但任务还在跑，说明消费者断开，必须取消任务以防死锁
-            if ctx.task and not ctx.task.done():
-                logger.warning(f"⚠️ Consumer disconnected early for {request_id}, cancelling worker.")
-                ctx.task.cancel()
-                # 让出控制权以便 loop 执行取消操作
-                try: await asyncio.sleep(0.1)
-                except: pass
+            # [修改] 消费者断开逻辑
+            # 不再 cancel worker，而是标记 disconnected 并清空队列
+            logger.info(f"ℹ️ Consumer disconnected for {request_id}. Worker will continue for stats.")
+            ctx.consumer_disconnected = True
+            
+            # [关键] 必须清空队列，以防 worker 正好卡在 queue.put() 上等待空位
+            # worker 在下一轮循环会检查 consumer_disconnected 并停止 put
+            while not ctx.stream_queue.empty():
+                try: ctx.stream_queue.get_nowait()
+                except: break
 
     async def _garbage_collector(self):
         now = datetime.now()
@@ -361,23 +393,15 @@ class AsyncHttpClient:
             if key in self.active_requests: del self.active_requests[key]
 
     async def close(self):
-        # [FIX-4] 关闭时清理所有残余任务
-        logger.info("Closing AsyncHttpClient, cancelling all active requests...")
-        
-        # 1. 收集所有未完成的任务
+        logger.info("Closing AsyncHttpClient, cancelling active requests...")
         pending_tasks = []
         for _, ctx in self.active_requests.items():
             if ctx.task and not ctx.task.done():
                 ctx.task.cancel()
                 pending_tasks.append(ctx.task)
         
-        # 2. 等待它们优雅退出 (它们会捕获 CancelledError 并处理 finally)
         if pending_tasks:
-            # return_exceptions=True 防止某个任务报错打断关闭流程
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         
-        # 3. 安全关闭 Session
-        if self.session: 
-            await self.session.close()
-        
+        if self.session: await self.session.close()
         self.scheduler.shutdown()
