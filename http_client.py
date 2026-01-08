@@ -213,8 +213,17 @@ class AsyncHttpClient:
                     last_error = asyncio.TimeoutError("Global timeout exceeded")
                     logger.error(f"❌ Global timeout exceeded for {ctx.request_id}")
                     break
-                
-                request_kwargs['timeout'] = aiohttp.ClientTimeout(total=remaining_time)
+
+                if req.is_stream:
+                    # 流式：建立连接30s超时
+                    request_kwargs['timeout'] = aiohttp.ClientTimeout(
+                        total=remaining_time,
+                        connect=60,
+                        sock_connect=30,
+                    )
+                else:
+                    # 非流式：只限总时间
+                    request_kwargs['timeout'] = aiohttp.ClientTimeout(total=remaining_time)
 
                 accumulated_body = bytearray()
                 last_http_code, last_error = None, None
@@ -299,9 +308,17 @@ class AsyncHttpClient:
 
                 except Exception as e:
                     last_error = e
-                    if isinstance(e, HttpErrorWithContent): last_http_code = e.status_code
+                    should_stop_retry = False
+
+                    if isinstance(e, HttpErrorWithContent): 
+                        last_http_code = e.status_code
+                        if e.status_code not in {408, 429, 500, 502, 503, 504}:
+                            should_stop_retry = True
                     
                     if req.is_stream and stream_started_successfully and not req.retry_on_stream_error:
+                        should_stop_retry = True
+
+                    if should_stop_retry:
                         if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                         break 
                     
