@@ -24,6 +24,7 @@ dotenv.load_dotenv()
 
 
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
+STRIP_V1_PREFIX = os.getenv("STRIP_V1_PREFIX", "0") == "1"
 MODEL_NAME = os.getenv("MODEL_NAME", "")
 API_KEY = os.getenv("API_KEY", "your_api_key_here")
 parsed_target = urlparse(TARGET_SERVER)
@@ -187,10 +188,105 @@ async def auto_disconnect_connection(raw_request: Request, upstream_request_id: 
     except asyncio.CancelledError:
         return
 
+@app.post("/v1/responses")
+async def chat_responses(req:dict, request: Request):
+    """
+    代理 Chat Responses API 端点
+    """
+    try:
+        path = request.url.path
+        if STRIP_V1_PREFIX and path.startswith('/v1/'):
+            path = path[3:]  # 去掉 '/v1'
+        target_url = TARGET_SERVER.rstrip('/') + '/' + path.lstrip('/')
+        body_bytes = await request.body()
+        try:
+            body = orjson.loads(body_bytes)
+        except orjson.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+        # 透传 API Key: 优先使用请求头中的 Authorization，否则使用环境变量
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            auth_header = "Bearer " + API_KEY
+        elif not auth_header.startswith("Bearer "):
+            auth_header = "Bearer " + auth_header
+
+        # 设置模型名称
+        if MODEL_NAME and 'model' in body:
+            body["model"] = MODEL_NAME
+
+        # 检查是否为流式响应
+        client_wants_stream = body.get("stream", False)
+        
+        if client_wants_stream:
+            on_stream_start_callback = on_first_chunk_callback
+        else:
+            on_stream_start_callback = None
+
+        req_wrapper = RequestWrapper(
+            url=target_url,
+            method="POST",
+            headers={
+                "Authorization": auth_header,
+                "Content-Type": "application/json"
+            },
+            json=body,
+            is_stream=True,
+            keep_content_in_memory=False,
+            retry_on_stream_error=False,
+            timeout=REQUEST_TIMEOUT,
+            retry_interval=RETRY_INTERVAL,
+            max_retries=MAX_RETRIES,
+            on_stream_start=on_stream_start_callback,
+            on_success=on_request_complete_callback,
+            on_failure=on_request_error_callback,
+            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS
+        )
+
+        # 1. 提交任务
+        req_id = proxy_client.submit(req_wrapper)
+        logger.info(f"Forwarding chat responses request {req_id} (Stream: {client_wants_stream})")
+
+        asyncio.create_task(auto_disconnect_connection(request, req_id))
+
+        # 2. 等待上游连接建立结果
+        await proxy_client.wait_for_upstream_status(req_id)
+
+        # 3. 建立响应
+        if client_wants_stream:
+            return StreamingResponse(
+                proxy_client.stream_generator(req_id),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        else:
+            async def collect_response():
+                chunks = []
+                async for chunk in proxy_client.stream_generator(req_id):
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            
+            full_body = await collect_response()
+            return Response(content=full_body, media_type="application/json")
+
+    except HttpErrorWithContent:
+        raise
+    except Exception as e:
+        logger.error(f"Chat Responses Proxy Error: {str(e)}")
+        return ORJSONResponse(content={"error": str(e)}, status_code=500)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req:dict,request: Request):
     try:
-        target_url = TARGET_SERVER.rstrip('/') + '/' + request.url.path.lstrip('/')
+        # 根据 STRIP_V1_PREFIX 配置决定是否去掉 /v1 前缀
+        path = request.url.path
+        if STRIP_V1_PREFIX and path.startswith('/v1/'):
+            path = path[3:]  # 去掉 '/v1'
+        target_url = TARGET_SERVER.rstrip('/') + '/' + path.lstrip('/')
         body_bytes = await request.body()
         try:
             body = orjson.loads(body_bytes)
@@ -281,6 +377,9 @@ async def chat_completions(req:dict,request: Request):
 async def reverse_proxy(request: Request, path: str):
     global client_session
     # 构建目标URL
+    # 根据 STRIP_V1_PREFIX 配置决定是否去掉 v1/ 前缀
+    if STRIP_V1_PREFIX and path.startswith('v1/'):
+        path = path[3:]  # 去掉 'v1/'
     target_url = TARGET_SERVER.rstrip('/') + '/' + path.lstrip('/')
     # 保留原始查询参数
     if request.url.query:
