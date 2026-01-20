@@ -531,7 +531,7 @@ async def chat_completions(req: dict, request: Request):
         auth_header = "Bearer " + API_KEY
 
         client_wants_stream = body.get("stream", False)
-        body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
+        # body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(
                 status_code=400, detail="Model name is required but not provided."
