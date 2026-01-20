@@ -382,6 +382,10 @@ async def _stream_with_thought_signature(
                             elif "index" not in tc:
                                 tc["index"] = 0
 
+                        data["choices"][0]["delta"] = delta
+                        yield f"data: {orjson.dumps(data).decode()}\n\n".encode()
+                        continue
+
                 except orjson.JSONDecodeError:
                     pass
 
