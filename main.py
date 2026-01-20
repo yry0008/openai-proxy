@@ -528,7 +528,11 @@ async def chat_completions(req: dict, request: Request):
         # Restore thought_signature from reasoning_content back to extra_content format
         body = _restore_thought_signature(body)
 
-        auth_header = "Bearer " + API_KEY
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            raise HTTPException(status_code=401, detail="Authorization header missing")
+        elif not auth_header.startswith("Bearer "):
+            auth_header = "Bearer " + auth_header
 
         client_wants_stream = body.get("stream", False)
         # body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
