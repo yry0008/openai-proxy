@@ -314,6 +314,15 @@ async def _stream_with_thought_signature(
             if json_str and json_str != "[DONE]":
                 try:
                     data = orjson.loads(json_str)
+                    finish_reason = data.get("choices", [{}])[0].get("finish_reason", "")
+                    finish_reason_changed = False
+                    if finish_reason != "":
+                        tool_calls_count = len(seen_tool_ids)
+                        if tool_calls_count > 0 and finish_reason != "tool_calls":
+                            finish_reason = "tool_calls"
+                            data["choices"][0]["finish_reason"] = finish_reason
+                            finish_reason_changed = True
+                            
                     delta = data.get("choices", [{}])[0].get("delta", {})
                     ts = None
 
@@ -390,6 +399,10 @@ async def _stream_with_thought_signature(
                                 tc["index"] = 0
 
                         data["choices"][0]["delta"] = delta
+                        yield f"data: {orjson.dumps(data).decode()}\n\n".encode()
+                        continue
+
+                    if finish_reason_changed:
                         yield f"data: {orjson.dumps(data).decode()}\n\n".encode()
                         continue
 
