@@ -255,7 +255,7 @@ class AsyncHttpClient:
                         if req.is_stream:
                             stream_started_successfully = True
                             is_first_chunk = True
-                            async for chunk in response.content.iter_any():
+                            async for chunk in response.content:
                                 # 首字回调 TTFT
                                 if is_first_chunk:
                                     ttft = time.perf_counter() - start_time
