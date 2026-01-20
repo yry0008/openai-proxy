@@ -356,6 +356,13 @@ async def _stream_with_thought_signature(
 
                         if "tool_calls" in delta:
                             for tc in delta["tool_calls"]:
+                                tc_id = tc.get("id")
+                                if tc_id and tc_id not in seen_tool_ids:
+                                    seen_tool_ids.add(tc_id)
+                                    tc["index"] = len(seen_tool_ids) - 1
+                                elif "index" not in tc:
+                                    tc["index"] = 0
+
                                 tc_extra = (
                                     tc.get("extra_content")
                                     if tc.get("extra_content")
