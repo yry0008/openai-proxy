@@ -300,6 +300,8 @@ def _restore_thought_signature(body: dict) -> dict:
 async def _stream_with_thought_signature(
     proxy_client, req_id: str
 ) -> AsyncGenerator[bytes, None]:
+    seen_tool_names: set[str] = set()
+
     async for chunk in proxy_client.stream_generator(req_id):
         chunk_str = (
             chunk.decode("utf-8", errors="replace")
@@ -324,8 +326,9 @@ async def _stream_with_thought_signature(
                         for tc in tool_calls:
                             tc_extra = tc.get("extra_content", {})
                             tc_google = tc_extra.get("google", {})
-                            ts = tc_google.get("thought_signature")
-                            if ts:
+                            tc_thought = tc_google.get("thought_signature")
+                            if tc_thought:
+                                ts = tc_thought
                                 break
 
                     if ts:
@@ -352,9 +355,7 @@ async def _stream_with_thought_signature(
                                 del delta["extra_content"]
 
                         if "tool_calls" in delta:
-                            for i, tc in enumerate(delta["tool_calls"]):
-                                if "index" not in tc:
-                                    tc["index"] = i
+                            for tc in delta["tool_calls"]:
                                 tc_extra = (
                                     tc.get("extra_content")
                                     if tc.get("extra_content")
@@ -371,6 +372,16 @@ async def _stream_with_thought_signature(
                         data["choices"][0]["delta"] = delta
                         yield f"data: {orjson.dumps(data).decode()}\n\n".encode()
                         continue
+
+                    if "tool_calls" in delta:
+                        for tc in delta["tool_calls"]:
+                            func_name = tc.get("function", {}).get("name")
+                            if func_name and func_name not in seen_tool_names:
+                                seen_tool_names.add(func_name)
+                                tc["index"] = len(seen_tool_names) - 1
+                            elif "index" not in tc:
+                                tc["index"] = 0
+
                 except orjson.JSONDecodeError:
                     pass
 
