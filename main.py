@@ -11,6 +11,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
+from reasoning_extractor import transform_sse_stream, merge_reasoning_to_content
 import orjson
 
 import asyncio
@@ -300,9 +301,13 @@ async def chat_completions(req:dict,request: Request):
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
         
-        if 'stream_options' in body:                     
-            if 'continuous_usage_stats' in body['stream_options']:      
+        if 'stream_options' in body:
+            if 'continuous_usage_stats' in body['stream_options']:
                 del body['stream_options']['continuous_usage_stats']
+
+        # Merge reasoning_content back into content as <think> tags
+        if 'messages' in body and isinstance(body['messages'], list):
+            merge_reasoning_to_content(body['messages'])
 
         if client_wants_stream:
             on_stream_start_callback = on_first_chunk_callback
@@ -342,8 +347,9 @@ async def chat_completions(req:dict,request: Request):
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
         if client_wants_stream:
             return StreamingResponse(
-                proxy_client.stream_generator(
-                    req_id 
+                transform_sse_stream(
+                    proxy_client.stream_generator(req_id),
+                    is_streaming=True
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -355,10 +361,13 @@ async def chat_completions(req:dict,request: Request):
         else:
             async def collect_response():
                 chunks = []
-                async for chunk in proxy_client.stream_generator(req_id):
+                async for chunk in transform_sse_stream(
+                    proxy_client.stream_generator(req_id),
+                    is_streaming=False
+                ):
                     chunks.append(chunk)
                 return b"".join(chunks)
-            
+
             full_body = await collect_response()
             return Response(content=full_body, media_type="application/json")
 
