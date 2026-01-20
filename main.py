@@ -221,12 +221,13 @@ def _extract_thought_signature(response_data: dict) -> Optional[str]:
 
 
 def _clean_extra_content_from_message(message: dict) -> dict:
-    if "extra_content" in message:
-        del message["extra_content"]
-
     if "tool_calls" in message:
-        for tc in message["tool_calls"]:
-            if "extra_content" in tc:
+        for i, tc in enumerate(message["tool_calls"]):
+            if "index" not in tc:
+                tc["index"] = i
+            tc_extra = tc.get("extra_content") if tc.get("extra_content") else {}
+            tc_google = tc_extra.get("google", {}) if isinstance(tc_extra, dict) else {}
+            if "thought_signature" in tc_google:
                 del tc["extra_content"]
 
     return message
@@ -346,11 +347,25 @@ async def _stream_with_thought_signature(
                         yield f"data: {orjson.dumps(reasoning_chunk).decode()}\n\n".encode()
 
                         if "extra_content" in delta:
-                            del delta["extra_content"]
+                            google = delta.get("extra_content", {}).get("google", {})
+                            if "thought_signature" in google:
+                                del delta["extra_content"]
 
                         if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                if "extra_content" in tc:
+                            for i, tc in enumerate(delta["tool_calls"]):
+                                if "index" not in tc:
+                                    tc["index"] = i
+                                tc_extra = (
+                                    tc.get("extra_content")
+                                    if tc.get("extra_content")
+                                    else {}
+                                )
+                                tc_google = (
+                                    tc_extra.get("google", {})
+                                    if isinstance(tc_extra, dict)
+                                    else {}
+                                )
+                                if "thought_signature" in tc_google:
                                     del tc["extra_content"]
 
                         data["choices"][0]["delta"] = delta
