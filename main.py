@@ -300,7 +300,7 @@ def _restore_thought_signature(body: dict) -> dict:
 async def _stream_with_thought_signature(
     proxy_client, req_id: str
 ) -> AsyncGenerator[bytes, None]:
-    seen_tool_names: set[str] = set()
+    seen_tool_ids: set[str] = set()
 
     async for chunk in proxy_client.stream_generator(req_id):
         chunk_str = (
@@ -375,10 +375,10 @@ async def _stream_with_thought_signature(
 
                     if "tool_calls" in delta:
                         for tc in delta["tool_calls"]:
-                            func_name = tc.get("function", {}).get("name")
-                            if func_name and func_name not in seen_tool_names:
-                                seen_tool_names.add(func_name)
-                                tc["index"] = len(seen_tool_names) - 1
+                            tc_id = tc.get("id")
+                            if tc_id and tc_id not in seen_tool_ids:
+                                seen_tool_ids.add(tc_id)
+                                tc["index"] = len(seen_tool_ids) - 1
                             elif "index" not in tc:
                                 tc["index"] = 0
 
