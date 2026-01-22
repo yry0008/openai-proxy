@@ -118,7 +118,7 @@ class AsyncHttpClient:
     async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             # 不设置 json_serialize，我们在 _worker 中手动用 orjson
-            # 取消连接数限制：limit=0 表示无限制
+            # 取消连接数限制：设置一个几乎无限的连接池
             connector = aiohttp.TCPConnector(limit=2000, limit_per_host=2000)
             self.session = aiohttp.ClientSession(connector=connector)
         return self.session
@@ -208,12 +208,6 @@ class AsyncHttpClient:
         accumulated_body = bytearray()
         last_http_code, last_error = None, None
         
-        # 认证错误的重试计数（401, 403, 521, 523）最多重试2次
-        auth_error_retry_count = 0
-        # 定义错误码集合
-        auth_errors = {401, 403, 521, 523}
-        normal_retry_errors = {408, 429, 470, 471, 472, 500, 502, 503, 504, 520, 522, 524}
-        
         try:
             for attempt in range(1, total_attempts + 1):
                 remaining_time = deadline - time.time()
@@ -221,11 +215,18 @@ class AsyncHttpClient:
                     last_error = asyncio.TimeoutError("Global timeout exceeded")
                     logger.error(f"❌ Global timeout exceeded for {ctx.request_id}")
                     break
-                request_kwargs['timeout'] = aiohttp.ClientTimeout(
-                    total=remaining_time,
-                    connect=35,
-                    sock_connect=30,
-                )
+
+                if req.is_stream:
+                    # 流式：建立连接30s超时
+                    request_kwargs['timeout'] = aiohttp.ClientTimeout(
+                        total=remaining_time,
+                        connect=60,
+                        sock_connect=30,
+                    )
+                else:
+                    # 非流式：只限总时间
+                    request_kwargs['timeout'] = aiohttp.ClientTimeout(total=remaining_time)
+
                 accumulated_body = bytearray()
                 last_http_code, last_error = None, None
                 stream_started_successfully = False
@@ -310,16 +311,10 @@ class AsyncHttpClient:
                 except Exception as e:
                     last_error = e
                     should_stop_retry = False
-                    is_auth_error = False
-                    is_normal_retry_error = False
 
                     if isinstance(e, HttpErrorWithContent): 
                         last_http_code = e.status_code
-                        is_auth_error = e.status_code in auth_errors
-                        is_normal_retry_error = e.status_code in normal_retry_errors
-                        
-                        # 如果不是可重试的错误码，直接停止
-                        if not is_auth_error and not is_normal_retry_error:
+                        if e.status_code not in {408, 429, 500, 502, 503, 504}:
                             should_stop_retry = True
                     
                     if req.is_stream and stream_started_successfully and not req.retry_on_stream_error:
@@ -331,26 +326,8 @@ class AsyncHttpClient:
                     
                     # 检查是否还有重试机会 且 时间足够
                     if attempt < total_attempts and (deadline - time.time() > 0):
-                        # 针对认证错误的特殊处理
-                        if is_auth_error:
-                            if auth_error_retry_count >= 2:
-                                # 认证错误已重试2次，不再重试
-                                logger.warning(f"Auth error retry limit reached (2 times) for {ctx.request_id}")
-                                if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
-                                break
-                            # 认证错误使用固定间隔，不退坡
-                            backoff = req.retry_interval
-                            auth_error_retry_count += 1
-                            logger.warning(f"Auth error retry {auth_error_retry_count}/2 for {ctx.request_id}. Sleeping {backoff:.2f}s (fixed)")
-                        elif is_normal_retry_error:
-                            # 普通可重试错误使用指数退避
-                            backoff = min(req.retry_interval * (2 ** (attempt - 1)), 10.0)
-                            logger.warning(f"Retry {attempt}/{total_attempts} for {ctx.request_id}. Sleeping {backoff:.2f}s (exponential backoff)")
-                        else:
-                            # 其他错误也使用指数退避
-                            backoff = min(req.retry_interval * (2 ** (attempt - 1)), 10.0)
-                            logger.warning(f"Retry {attempt}/{total_attempts} for {ctx.request_id}. Sleeping {backoff:.2f}s")
-                        
+                        backoff = min(req.retry_interval * (2 ** (attempt - 1)), 10.0)
+                        logger.warning(f"Retry {attempt} failed: {e}. Sleeping {backoff:.2f}s")
                         await asyncio.sleep(backoff)
                         continue
                     else:
