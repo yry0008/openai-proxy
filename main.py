@@ -11,7 +11,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
-from reasoning_extractor import transform_sse_stream, merge_reasoning_to_content
+from reasoning_extractor import transform_sse_stream, transform_non_sse_response ,merge_reasoning_to_content
 import orjson
 
 import asyncio
@@ -361,14 +361,13 @@ async def chat_completions(req:dict,request: Request):
         else:
             async def collect_response():
                 chunks = []
-                async for chunk in transform_sse_stream(
-                    proxy_client.stream_generator(req_id),
-                    is_streaming=False
-                ):
+                async for chunk in proxy_client.stream_generator(req_id):
                     chunks.append(chunk)
-                return b"".join(chunks)
+                origin_body = b"".join(chunks)
+                return origin_body
 
             full_body = await collect_response()
+            full_body = await transform_non_sse_response(full_body)
             return Response(content=full_body, media_type="application/json")
 
     except HttpErrorWithContent:
@@ -470,4 +469,4 @@ async def reverse_proxy(request: Request, path: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3280)
+    uvicorn.run(app, host="0.0.0.0", port=3281)

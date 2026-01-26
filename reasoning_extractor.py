@@ -249,3 +249,35 @@ async def transform_sse_stream(
     except Exception as e:
         logger.error(f"Error in transform_sse_stream: {e}", exc_info=True)
         raise
+
+
+async def transform_non_sse_response(
+    response_bytes: bytes,
+) -> bytes:
+    """Transform non-SSE response to extract <think> tags into reasoning_content."""
+    extractor = ReasoningExtractor()
+
+    try:
+        text = response_bytes.decode("utf-8", errors="replace")
+        data = orjson.loads(text)
+    except Exception as e:
+        logger.warning(f"Failed to parse non-SSE JSON: {e}")
+        return response_bytes
+
+    choices = data.get("choices", [])
+    if not choices:
+        return response_bytes
+
+    choice = choices[0]
+    message = choice.get("message", {})
+    content = message.get("content")
+
+    if content is None or content == "":
+        return response_bytes
+
+    cleaned_content, reasoning_content = extractor.process_content(content)
+    message["content"] = cleaned_content
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+
+    return orjson.dumps(data)
