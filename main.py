@@ -24,10 +24,10 @@ dotenv.load_dotenv()
 
 
 
-TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
+TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.x-aio.com")
 STRIP_V1_PREFIX = os.getenv("STRIP_V1_PREFIX", "0") == "1"
 MODEL_NAME = os.getenv("MODEL_NAME", "")
-API_KEY = os.getenv("API_KEY", "your_api_key_here")
+API_KEY = os.getenv("API_KEY", "sk-10c617aa58b74fc29d190e8db2d4d5fe")
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
