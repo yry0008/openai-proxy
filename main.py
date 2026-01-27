@@ -224,13 +224,18 @@ async def chat_responses(req:dict, request: Request):
         else:
             on_stream_start_callback = None
 
+        # 构造 headers，包含 X-Forwarded-For
+        upstream_headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json"
+        }
+        if "x-forwarded-for" in request.headers:
+            upstream_headers["X-Forwarded-For"] = request.headers["x-forwarded-for"]
+
         req_wrapper = RequestWrapper(
             url=target_url,
             method="POST",
-            headers={
-                "Authorization": auth_header,
-                "Content-Type": "application/json"
-            },
+            headers=upstream_headers, # 使用新的 headers
             json=body,
             is_stream=True,
             keep_content_in_memory=False,
@@ -294,7 +299,12 @@ async def chat_completions(req:dict,request: Request):
         except orjson.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        auth_header = "Bearer " + API_KEY
+        # 透传 API Key: 优先使用请求头中的 Authorization，否则使用环境变量
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            auth_header = "Bearer " + API_KEY
+        elif not auth_header.startswith("Bearer "):
+            auth_header = "Bearer " + auth_header
 
         client_wants_stream = body.get("stream", False)
         body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
@@ -313,13 +323,19 @@ async def chat_completions(req:dict,request: Request):
             on_stream_start_callback = on_first_chunk_callback
         else:
             on_stream_start_callback = None
+
+        # 构造 headers，包含 X-Forwarded-For
+        upstream_headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json"
+        }
+        if "x-forwarded-for" in request.headers:
+            upstream_headers["X-Forwarded-For"] = request.headers["x-forwarded-for"]
+
         req_wrapper = RequestWrapper(
             url=target_url,
             method="POST",
-            headers={
-                "Authorization": auth_header,
-                "Content-Type": "application/json"
-            },
+            headers=upstream_headers, # 使用新的 headers
             json=body,
             is_stream=True, 
             keep_content_in_memory=False, 
@@ -339,9 +355,7 @@ async def chat_completions(req:dict,request: Request):
 
         asyncio.create_task(auto_disconnect_connection(request, req_id))
 
-        # 2. 【关键修复】同步等待上游连接建立结果
-        # 如果上游返回 401/400/500，这里会直接抛出 HttpErrorWithContent
-        # 然后被 @app.exception_handler 捕获，返回正确的错误码给客户端
+        # 2. 同步等待上游连接建立结果
         await proxy_client.wait_for_upstream_status(req_id)
 
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
