@@ -68,6 +68,7 @@ async def transform_sse_stream(
                 line = "data: " + line[5:].lstrip()
             fixed_lines.append(line)
         text = "\n".join(fixed_lines)
+        chunk = text.encode("utf-8")
 
         if not text.startswith("data: ") or "data: [DONE]" in text:
             yield chunk
