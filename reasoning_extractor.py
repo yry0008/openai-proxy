@@ -26,8 +26,24 @@ def divide_reasoning_content(messages: list) -> list:
 
         content = message.get("content", "")
         if not content or not isinstance(content, str):
-            continue
+            if type(content) is list and len(content) ==1:
+                item = content[0]
+                if isinstance(item, dict) and "type" in item and item["type"] == "text":
+                    sub_content = item.get("text", "")
+                    if "<think>" in sub_content and "</think>" in sub_content:
+                        think_start = sub_content.find("<think>")
+                        think_end = sub_content.find("</think>")
 
+                        if think_start != -1 and think_end != -1 and think_end > think_start:
+                            reasoning = sub_content[think_start + 7 : think_end]
+                            before_think = sub_content[:think_start]
+                            after_think = sub_content[think_end + 8 :]
+                            new_content = before_think + after_think
+
+                            message["reasoning_content"] = reasoning
+                            message["reasoning"] = reasoning  # For backward compatibility
+                            message["content"] = new_content
+            continue
         if "<think>" in content and "</think>" in content:
             think_start = content.find("<think>")
             think_end = content.find("</think>")
@@ -107,8 +123,25 @@ async def transform_sse_stream(
         choice = choices[0]
         delta = choice.get("delta", {})
 
-        reasoning = delta.get("reasoning_content")
-        content = delta.get("content")
+        # 不会有只有reasoning_content，且同时没有content和tool_calls的情况，所以我们只需要处理 tool_calls 开始的情况
+        if "tool_calls" in delta:
+            # 开始 tool_calls 了，需要确保 thinking 结束
+            if has_started_think and not has_ended_think:
+                new_data = data.copy()
+                new_data["choices"][0]["delta"] = {"content": "</think>"}
+                # 标记 thinking 结束
+                yield b"data: " + orjson.dumps(new_data) + b"\n\n"
+                has_ended_think = True
+                # 此时继续处理当前 chunk，不要漏掉 tool_calls
+            yield chunk
+            continue
+                
+
+        reasoning = delta.get("reasoning_content", None)
+        content = delta.get("content",None)
+        if reasoning is None and content is None:
+            yield chunk
+            continue
 
         new_content_fragment = ""
 
