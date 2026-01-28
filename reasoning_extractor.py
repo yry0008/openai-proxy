@@ -57,6 +57,11 @@ async def transform_sse_stream(
             yield chunk
             continue
 
+        if text.startswith("data:") and len(text) > 5 and text[5]!= " ":
+            # fix for malformed sse where there is no space after data:
+            text = "data: " + text[5:].lstrip()
+            
+
         if not text.startswith("data: ") or "data: [DONE]" in text:
             yield chunk
             continue
