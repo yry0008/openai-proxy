@@ -12,22 +12,32 @@ from typing import AsyncGenerator, Optional, Tuple, List
 logger = logging.getLogger(__name__)
 
 
-def merge_reasoning_to_content(messages: list) -> list:
-    """Merge reasoning_content back into content as <think> tags for input messages."""
+def divide_reasoning_content(messages: list) -> list:
+    """
+    Divide reasoning_content from content wrapped in <think> tags for input messages.
+    """
     # This function remains unchanged as it already implements the "thinking format" for inputs.
     for message in messages:
         if not isinstance(message, dict):
             continue
 
-        reasoning = message.get("reasoning_content")
         content = message.get("content", "")
+        if not content or not isinstance(content, str):
+            continue
 
-        if reasoning:
-            # Handle case where content might be None
-            if content is None:
-                content = ""
-            message["content"] = f"<think>{reasoning}</think>{content}"
-            del message["reasoning_content"]
+        if "<think>" in content and "</think>" in content:
+            think_start = content.find("<think>")
+            think_end = content.find("</think>")
+
+            if think_start != -1 and think_end != -1 and think_end > think_start:
+                reasoning = content[think_start + 7 : think_end]
+                before_think = content[:think_start]
+                after_think = content[think_end + 8 :]
+                new_content = before_think + after_think
+
+                message["reasoning_content"] = reasoning
+                message["reasoning"] = reasoning  # For backward compatibility
+                message["content"] = new_content
 
     return messages
 

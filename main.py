@@ -11,7 +11,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
-from reasoning_extractor import transform_sse_stream, transform_non_sse_response ,merge_reasoning_to_content
+from reasoning_extractor import transform_sse_stream, transform_non_sse_response ,divide_reasoning_content
 import orjson
 
 import asyncio
@@ -317,7 +317,7 @@ async def chat_completions(req:dict,request: Request):
 
         # Merge reasoning_content back into content as <think> tags
         if 'messages' in body and isinstance(body['messages'], list):
-            merge_reasoning_to_content(body['messages'])
+            divide_reasoning_content(body['messages'])
 
         if client_wants_stream:
             on_stream_start_callback = on_first_chunk_callback
