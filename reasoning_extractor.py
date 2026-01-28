@@ -21,6 +21,9 @@ def divide_reasoning_content(messages: list) -> list:
         if not isinstance(message, dict):
             continue
 
+        if message.get("role", "") != "assistant":
+            continue
+
         content = message.get("content", "")
         if not content or not isinstance(content, str):
             continue
