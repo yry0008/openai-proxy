@@ -11,6 +11,7 @@ from typing import AsyncGenerator, Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
 
+
 def merge_reasoning_to_content(messages: list) -> list:
     """Merge reasoning_content back into content as <think> tags for input messages."""
     # This function remains unchanged as it already implements the "thinking format" for inputs.
@@ -57,10 +58,16 @@ async def transform_sse_stream(
             yield chunk
             continue
 
-        if text.startswith("data:") and len(text) > 5 and text[5]!= " ":
-            # fix for malformed sse where there is no space after data:
-            text = "data: " + text[5:].lstrip()
-            
+        # Fix malformed SSE: handle cases where data: has no space after it
+        # This handles both single-line and multi-line chunks
+        lines = text.split("\n")
+        fixed_lines = []
+        for line in lines:
+            if line.startswith("data:") and len(line) > 5 and line[5] != " ":
+                # Insert space after data:
+                line = "data: " + line[5:].lstrip()
+            fixed_lines.append(line)
+        text = "\n".join(fixed_lines)
 
         if not text.startswith("data: ") or "data: [DONE]" in text:
             yield chunk
@@ -85,10 +92,10 @@ async def transform_sse_stream(
 
         choice = choices[0]
         delta = choice.get("delta", {})
-        
+
         reasoning = delta.get("reasoning_content")
         content = delta.get("content")
-        
+
         new_content_fragment = ""
 
         # 1. Handle Reasoning: If reasoning content is present, append it.
@@ -98,24 +105,24 @@ async def transform_sse_stream(
                 new_content_fragment += "<think>"
                 has_started_think = True
             new_content_fragment += reasoning
-        
+
         # 2. Handle Content: If actual content appears, it signals the end of reasoning.
-        #    We assume 'content' being non-None (even empty string) marks the transition 
+        #    We assume 'content' being non-None (even empty string) marks the transition
         #    or the body part.
         if content is not None:
             if has_started_think and not has_ended_think:
                 new_content_fragment += "</think>"
                 has_ended_think = True
             new_content_fragment += content
-            
+
         # 3. Update the delta with the merged content
         if new_content_fragment:
             delta["content"] = new_content_fragment
-        
+
         # Always remove reasoning_content so the client doesn't see the separate field
         if "reasoning_content" in delta:
             del delta["reasoning_content"]
-            
+
         # Re-serialize and yield
         data["choices"][0]["delta"] = delta
         yield b"data: " + orjson.dumps(data) + b"\n\n"
@@ -138,7 +145,7 @@ async def transform_non_sse_response(
 
     choice = choices[0]
     message = choice.get("message", {})
-    
+
     reasoning = message.get("reasoning_content")
     content = message.get("content")
 
@@ -147,8 +154,8 @@ async def transform_non_sse_response(
             content = ""
         # Merge logic: <think>...</think> + content
         new_content = f"<think>{reasoning}</think>{content}"
-        
+
         message["content"] = new_content
         del message["reasoning_content"]
-    
+
     return orjson.dumps(data)
