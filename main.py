@@ -297,6 +297,7 @@ async def chat_completions(req:dict,request: Request):
 
         client_wants_stream = body.get("stream", False)
         body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
+        body["enable_thinking"] = True
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
         
