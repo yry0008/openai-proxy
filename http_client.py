@@ -306,7 +306,7 @@ class AsyncHttpClient:
                             stream_started_successfully = True
                             stream_queue = ctx.stream_queue
                             is_first_chunk = True
-                            async for chunk in response.content.iter_any():
+                            async for chunk in response.content:
                                 if is_first_chunk:
                                     ttft = time.perf_counter() - start_time
                                     self._trigger_stream_start_callback(req.on_stream_start, ctx.request_id, ttft, req.stream_start_data)

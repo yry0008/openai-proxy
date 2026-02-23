@@ -267,7 +267,7 @@ async def chat_responses(req:dict, request: Request):
         else:
             async def collect_response():
                 chunks = []
-                async for chunk in proxy_client.stream_generator(req_id):
+                async for chunk in proxy_client.stream_generator_with_heartbeat(req_id):
                     chunks.append(chunk)
                 return b"".join(chunks)
             

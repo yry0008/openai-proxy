@@ -190,27 +190,29 @@ async def transform_sse_stream(
 
                 parts = extractor.process_content_for_streaming(content)
 
-                for content_before, reasoning, content_after in parts:
-                    if content_before:
-                        part_data = orjson.loads(orjson.dumps(data))
-                        part_delta = part_data["choices"][0]["delta"]
-                        part_delta["content"] = content_before
-                        part_delta.pop("reasoning_content", None)
-                        yield b"data: " + orjson.dumps(part_data) + b"\n\n"
+                content_before = parts[0][0]
+                reasoning = parts[0][1]
+                content_after = parts[0][2]
+                if content_before:
+                    part_data = orjson.loads(orjson.dumps(data))
+                    part_delta = part_data["choices"][0]["delta"]
+                    part_delta["content"] = content_before
+                    part_delta.pop("reasoning_content", None)
+                    yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
-                    if reasoning:
-                        part_data = orjson.loads(orjson.dumps(data))
-                        part_delta = part_data["choices"][0]["delta"]
-                        part_delta["content"] = None # 显示None，即使没有数据也要 None
-                        part_delta["reasoning_content"] = reasoning
-                        yield b"data: " + orjson.dumps(part_data) + b"\n\n"
+                if reasoning:
+                    part_data = orjson.loads(orjson.dumps(data))
+                    part_delta = part_data["choices"][0]["delta"]
+                    part_delta["content"] = None # 显示None，即使没有数据也要 None
+                    part_delta["reasoning_content"] = reasoning
+                    yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
-                    if content_after:
-                        part_data = orjson.loads(orjson.dumps(data))
-                        part_delta = part_data["choices"][0]["delta"]
-                        part_delta["content"] = content_after
-                        part_delta.pop("reasoning_content", None)
-                        yield b"data: " + orjson.dumps(part_data) + b"\n\n"
+                if content_after:
+                    part_data = orjson.loads(orjson.dumps(data))
+                    part_delta = part_data["choices"][0]["delta"]
+                    part_delta["content"] = content_after
+                    part_delta.pop("reasoning_content", None)
+                    yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
         else:
             chunks = []
