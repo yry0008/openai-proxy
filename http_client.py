@@ -9,10 +9,13 @@ from typing import Callable, Optional, Dict, Any, AsyncGenerator, Union, Awaitab
 from dataclasses import dataclass, field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
+from tempfile import SpooledTemporaryFile
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+ResponseBuffer = Union[bytearray, SpooledTemporaryFile]
 
 # --- 枚举与数据类 ---
 
@@ -34,12 +37,13 @@ class RequestResult:
     status: RequestStatus
     content: Union[str, bytes, None]
     http_code: Optional[int] = None
-    error: Optional[Exception] = None
+    error: Optional[BaseException] = None
     json_body: Any = None 
 
 # 回调函数类型定义
 OnStreamStartCallback = Callable[[str, float, Any], Union[None, Awaitable[None]]]
 CallbackType = Callable[['RequestResult', Any], Union[None, Awaitable[None]]]
+
 
 @dataclass
 class RequestWrapper:
@@ -62,7 +66,7 @@ class RequestWrapper:
     
     # 行为配置
     keep_content_in_memory: bool = True 
-    max_memory_size: int = 100 * 1024 * 1024 # 100 MB
+    max_memory_size: int = 256 * 1024
 
     max_retries: int = 0
     retry_interval: float = 1.0
@@ -119,7 +123,7 @@ class AsyncHttpClient:
         if self.session is None or self.session.closed:
             # 不设置 json_serialize，我们在 _worker 中手动用 orjson
             # 取消连接数限制：limit=0 表示无限制
-            connector = aiohttp.TCPConnector(limit=2000, limit_per_host=2000)
+            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
             self.session = aiohttp.ClientSession(connector=connector)
         return self.session
 
@@ -183,10 +187,51 @@ class AsyncHttpClient:
         if res.content: return orjson.loads(res.content)
         return None
 
-    def _try_parse_json(self, data: bytearray) -> Any:
-        if not data: return None
-        try: return orjson.loads(bytes(data))
+    def _new_response_buffer(self, req: RequestWrapper) -> Optional[ResponseBuffer]:
+        if not req.keep_content_in_memory:
+            return None
+        return SpooledTemporaryFile(max_size=req.max_memory_size, mode="w+b")
+
+    @staticmethod
+    def _append_response_chunk(accumulator: Optional[ResponseBuffer], chunk: bytes) -> None:
+        if not accumulator:
+            return
+        if isinstance(accumulator, bytearray):
+            accumulator.extend(chunk)
+            return
+        accumulator.write(chunk)
+
+    @staticmethod
+    def _read_response_buffer(accumulator: Optional[ResponseBuffer]) -> bytes:
+        if accumulator is None:
+            return b""
+        if isinstance(accumulator, bytearray):
+            return bytes(accumulator)
+
+        pos = accumulator.tell()
+        accumulator.seek(0)
+        body = accumulator.read()
+        accumulator.seek(pos)
+        return body
+
+    @staticmethod
+    def _close_response_buffer(accumulator: Optional[ResponseBuffer]) -> None:
+        if isinstance(accumulator, SpooledTemporaryFile):
+            accumulator.close()
+
+    def _try_parse_json(self, data: Optional[ResponseBuffer]) -> Any:
+        body = self._read_response_buffer(data)
+        if not body: return None
+        try: return orjson.loads(body)
         except Exception: return None
+
+    @staticmethod
+    def _prepare_content(data: Optional[ResponseBuffer], keep_memory: bool) -> Union[str, bytes]:
+        if not keep_memory: return "[Content Dropped]"
+        content = AsyncHttpClient._read_response_buffer(data)
+        try: return content.decode('utf-8')
+        except: return content
+
 
     async def _worker(self, ctx: RequestContext):
         req = ctx.wrapper
@@ -205,9 +250,10 @@ class AsyncHttpClient:
             request_kwargs['data'] = req.data
 
         total_attempts = req.max_retries + 1
-        accumulated_body = bytearray()
+        accumulated_body = self._new_response_buffer(req)
         last_http_code, last_error = None, None
-        
+        stream_queue = ctx.stream_queue if req.is_stream else None
+
         # 认证错误的重试计数（401, 403, 521, 523）最多重试2次
         auth_error_retry_count = 0
         # 定义错误码集合
@@ -226,7 +272,9 @@ class AsyncHttpClient:
                     connect=35,
                     sock_connect=30,
                 )
-                accumulated_body = bytearray()
+                if accumulated_body is not None:
+                    self._close_response_buffer(accumulated_body)
+                accumulated_body = self._new_response_buffer(req)
                 last_http_code, last_error = None, None
                 stream_started_successfully = False
                 start_time = time.perf_counter()
@@ -239,12 +287,14 @@ class AsyncHttpClient:
                         last_http_code = response.status
                         
                         # --- 错误状态码处理 ---
+                        error_bytes = b""
                         if response.status >= 400:
                             try:
                                 error_bytes = await response.read()
-                                if req.keep_content_in_memory: accumulated_body.extend(error_bytes)
-                            except: error_bytes = b""
-                            
+                                self._append_response_chunk(accumulated_body, error_bytes)
+                            except:
+                                pass
+
                             # 抛出异常进入 except 块处理（决定是否重试）
                             raise HttpErrorWithContent(response.status, error_bytes, f"HTTP {response.status}")
 
@@ -254,9 +304,9 @@ class AsyncHttpClient:
 
                         if req.is_stream:
                             stream_started_successfully = True
+                            stream_queue = ctx.stream_queue
                             is_first_chunk = True
-                            async for chunk in response.content:
-                                # 首字回调 TTFT
+                            async for chunk in response.content.iter_any():
                                 if is_first_chunk:
                                     ttft = time.perf_counter() - start_time
                                     self._trigger_stream_start_callback(req.on_stream_start, ctx.request_id, ttft, req.stream_start_data)
@@ -264,22 +314,19 @@ class AsyncHttpClient:
 
                                 # [修改] 仅当消费者未断开时才 push 到队列
                                 # 如果已断开，跳过 push 以免阻塞，但继续执行下面的 accumulate 逻辑
-                                if not ctx.consumer_disconnected:
-                                    await ctx.stream_queue.put(chunk)
-                                
+                                if stream_queue is not None and not ctx.consumer_disconnected:
+                                    await stream_queue.put(chunk)
+
                                 # [修改] 即使断开，依然统计完整数据
-                                if req.keep_content_in_memory: 
-                                    accumulated_body.extend(chunk)
-                                    if len(accumulated_body) > req.max_memory_size:
-                                        raise ValueError(f"Response too large > {req.max_memory_size} bytes")
+                                self._append_response_chunk(accumulated_body, chunk)
 
                             # 流结束，放入 sentinel (仅当没断开时)
-                            if not ctx.consumer_disconnected:
-                                await ctx.stream_queue.put(ctx.sentinel)
+                            if not ctx.consumer_disconnected and stream_queue is not None:
+                                await stream_queue.put(ctx.sentinel)
                         else:
                             if req.keep_content_in_memory:
                                 body_bytes = await response.read()
-                                accumulated_body.extend(body_bytes)
+                                self._append_response_chunk(accumulated_body, body_bytes)
                             else: await response.read()
 
                         ctx.status = RequestStatus.COMPLETED
@@ -297,7 +344,7 @@ class AsyncHttpClient:
                     partial = self._prepare_content(accumulated_body, req.keep_content_in_memory)
                     parsed_json = self._try_parse_json(accumulated_body) if req.keep_content_in_memory else None
                     
-                    if req.is_stream and not ctx.consumer_disconnected: await ctx.stream_queue.put(e)
+                    if req.is_stream and not ctx.consumer_disconnected and stream_queue is not None: await stream_queue.put(e)
                     if not ctx.startup_future.done(): ctx.startup_future.set_exception(e)
                     
                     result_obj = RequestResult(ctx.request_id, RequestStatus.CANCELLED, partial, last_http_code, e, parsed_json)
@@ -358,9 +405,9 @@ class AsyncHttpClient:
                         break
             
             ctx.status = RequestStatus.FAILED
-            if req.is_stream and not ctx.consumer_disconnected:
+            if req.is_stream and not ctx.consumer_disconnected and stream_queue is not None:
                 error_to_propagate = last_error if last_error else Exception("Unknown Error in Worker")
-                await ctx.stream_queue.put(error_to_propagate)
+                await stream_queue.put(error_to_propagate)
             
             if not ctx.startup_future.done():
                 ctx.startup_future.set_exception(last_error or Exception("Worker Failed"))
@@ -376,14 +423,10 @@ class AsyncHttpClient:
             self._trigger_callback(req.on_failure, result_obj, req.user_data)
 
         finally:
+            self._close_response_buffer(accumulated_body)
             # TTL GC 关键点：标记结束时间
             if ctx.finished_at is None:
                 ctx.finished_at = datetime.now()
-
-    def _prepare_content(self, data: bytearray, keep_memory: bool) -> Union[str, bytes]:
-        if not keep_memory: return "[Content Dropped]"
-        try: return data.decode('utf-8')
-        except: return bytes(data)
 
     def _trigger_stream_start_callback(self, callback:Union[OnStreamStartCallback, None], req_id:str, ttft:float, custom_data:Any):
         if not callback: return
@@ -405,10 +448,12 @@ class AsyncHttpClient:
     async def stream_generator(self, request_id: str) -> AsyncGenerator[bytes, None]:
         ctx = self.active_requests.get(request_id)
         if not ctx or not ctx.wrapper.is_stream: raise ValueError("Invalid ID")
-        
+        stream_queue = ctx.stream_queue
+        if stream_queue is None: raise ValueError("Stream queue unavailable")
+
         try:
             while True:
-                data = await ctx.stream_queue.get()
+                data = await stream_queue.get()
                 if isinstance(data, Exception): raise data
                 if data is ctx.sentinel: break
                 yield data
@@ -417,11 +462,11 @@ class AsyncHttpClient:
             # 不再 cancel worker，而是标记 disconnected 并清空队列
             logger.info(f"ℹ️ Consumer disconnected for {request_id}. Worker will continue for stats.")
             ctx.consumer_disconnected = True
-            
+
             # [关键] 必须清空队列，以防 worker 正好卡在 queue.put() 上等待空位
             # worker 在下一轮循环会检查 consumer_disconnected 并停止 put
-            while not ctx.stream_queue.empty():
-                try: ctx.stream_queue.get_nowait()
+            while not stream_queue.empty():
+                try: stream_queue.get_nowait()
                 except: break
 
     async def _garbage_collector(self):
@@ -429,7 +474,7 @@ class AsyncHttpClient:
         retention = timedelta(seconds=self.result_retention_seconds)
         keys_to_remove = []
         for req_id, ctx in self.active_requests.items():
-            if ctx.task.done() and ctx.finished_at and (now - ctx.finished_at > retention):
+            if ctx.task is not None and ctx.task.done() and ctx.finished_at and (now - ctx.finished_at > retention):
                 keys_to_remove.append(req_id)
         for key in keys_to_remove:
             if key in self.active_requests: del self.active_requests[key]
