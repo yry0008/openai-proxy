@@ -300,6 +300,16 @@ async def chat_completions(req:dict,request: Request):
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
         
+        enable_thinking = True 
+        if "thinking" in body:
+            if "type" in body["thinking"]:
+                if body["thinking"]["type"] == "enabled" or body["thinking"]["type"] == "adaptive":
+                    enable_thinking = True
+                elif body["thinking"]["type"] == "disabled":
+                    enable_thinking = False
+            del body["thinking"]  # 无论如何都删除 thinking 字段，避免传给上游引起错误
+        body["enable_thinking"] = enable_thinking
+
         if 'stream_options' in body:                     
             if 'continuous_usage_stats' in body['stream_options']:      
                 del body['stream_options']['continuous_usage_stats']
