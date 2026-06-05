@@ -26,7 +26,7 @@ dotenv.load_dotenv()
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
 STRIP_V1_PREFIX = os.getenv("STRIP_V1_PREFIX", "0") == "1"
 MODEL_NAME = os.getenv("MODEL_NAME", "")
-API_KEY = os.getenv("API_KEY", "your_api_key_here")
+API_KEY = os.getenv("API_KEY", "")
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
 TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
@@ -293,7 +293,12 @@ async def chat_completions(req:dict,request: Request):
         except orjson.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        auth_header = "Bearer " + API_KEY
+        # 透传 API Key: 优先使用请求头中的 Authorization，否则使用环境变量
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            auth_header = "Bearer " + API_KEY
+        elif not auth_header.startswith("Bearer "):
+            auth_header = "Bearer " + auth_header
 
         client_wants_stream = body.get("stream", False)
         body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
@@ -471,4 +476,10 @@ async def reverse_proxy(request: Request, path: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3280)
+    workers = int(os.getenv("WORKERS", 1))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=3280,
+        workers=workers,
+    )
