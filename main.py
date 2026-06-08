@@ -34,6 +34,7 @@ TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSock
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
 RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
+CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")  # 自定义上游请求 User-Agent，留空则使用默认
 
 client_session: aiohttp.ClientSession = None
 
@@ -165,6 +166,31 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
+def _make_model_replace_hook(original_model: str):
+    """创建 SSE chunk hook，将上游响应中顶层 model 字段替换为客户端请求的原始模型名称。"""
+    def hook(event: bytes) -> bytes:
+        lines = event.split(b"\n")
+        result = []
+        for line in lines:
+            if not line.startswith(b"data: "):
+                result.append(line)
+                continue
+            payload = line[6:]
+            if payload.strip() == b"[DONE]":
+                result.append(line)
+                continue
+            try:
+                data = orjson.loads(payload)
+                if isinstance(data, dict) and "model" in data:
+                    data["model"] = original_model
+                    result.append(b"data: " + orjson.dumps(data))
+                    continue
+            except (orjson.JSONDecodeError, ValueError):
+                pass
+            result.append(line)
+        return b"\n".join(result)
+    return hook
+
 async def on_request_complete_callback(result:RequestResult,data):
     logger.info(f"Request {result.request_id} completed with status {result.status}.")
 
@@ -223,13 +249,17 @@ async def chat_responses(req:dict, request: Request):
         else:
             on_stream_start_callback = None
 
+        _headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json"
+        }
+        if CUSTOM_USER_AGENT:
+            _headers["User-Agent"] = CUSTOM_USER_AGENT
+
         req_wrapper = RequestWrapper(
             url=target_url,
             method="POST",
-            headers={
-                "Authorization": auth_header,
-                "Content-Type": "application/json"
-            },
+            headers=_headers,
             json=body,
             is_stream=True,
             keep_content_in_memory=False,
@@ -301,6 +331,7 @@ async def chat_completions(req:dict,request: Request):
             auth_header = "Bearer " + auth_header
 
         client_wants_stream = body.get("stream", False)
+        original_model = body.get("model", "")
         body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
@@ -313,13 +344,16 @@ async def chat_completions(req:dict,request: Request):
             on_stream_start_callback = on_first_chunk_callback
         else:
             on_stream_start_callback = None
+        _headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json"
+        }
+        if CUSTOM_USER_AGENT:
+            _headers["User-Agent"] = CUSTOM_USER_AGENT
         req_wrapper = RequestWrapper(
             url=target_url,
             method="POST",
-            headers={
-                "Authorization": auth_header,
-                "Content-Type": "application/json"
-            },
+            headers=_headers,
             json=body,
             is_stream=True, 
             keep_content_in_memory=False, 
@@ -348,7 +382,8 @@ async def chat_completions(req:dict,request: Request):
         if client_wants_stream:
             return StreamingResponse(
                 proxy_client.stream_generator(
-                    req_id 
+                    req_id,
+                    chunk_hook=_make_model_replace_hook(original_model) if original_model else None
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -365,6 +400,14 @@ async def chat_completions(req:dict,request: Request):
                 return b"".join(chunks)
             
             full_body = await collect_response()
+            if original_model:
+                try:
+                    resp_data = orjson.loads(full_body)
+                    if isinstance(resp_data, dict) and "model" in resp_data:
+                        resp_data["model"] = original_model
+                        full_body = orjson.dumps(resp_data)
+                except Exception:
+                    pass
             return Response(content=full_body, media_type="application/json")
 
     except HttpErrorWithContent:
@@ -424,6 +467,9 @@ async def reverse_proxy(request: Request, path: str):
     
     # 转换headers为dict格式
     request_headers = dict(headers)
+
+    if CUSTOM_USER_AGENT:
+        request_headers["User-Agent"] = CUSTOM_USER_AGENT
     
     # 配置超时和连接参数
     timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=300)  # 5分钟超时，适用于长时间流式响应
