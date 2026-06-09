@@ -11,7 +11,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
-from reasoning_extractor import transform_sse_stream, transform_non_sse_response ,merge_reasoning_to_content
+from reasoning_extractor import transform_sse_stream, transform_non_sse_response, merge_reasoning_to_content
 import orjson
 
 import asyncio
@@ -386,9 +386,12 @@ async def chat_completions(req:dict,request: Request):
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
         if client_wants_stream:
             return StreamingResponse(
-                proxy_client.stream_generator(
-                    req_id,
-                    chunk_hook=_make_model_replace_hook(original_model) if original_model else None
+                transform_sse_stream(
+                    proxy_client.stream_generator(
+                        req_id,
+                        chunk_hook=_make_model_replace_hook(original_model) if original_model else None
+                    ),
+                    is_streaming=True
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -406,6 +409,7 @@ async def chat_completions(req:dict,request: Request):
                 return origin_body
 
             full_body = await collect_response()
+            full_body = await transform_non_sse_response(full_body)
             if original_model:
                 try:
                     resp_data = orjson.loads(full_body)
