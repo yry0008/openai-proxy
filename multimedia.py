@@ -266,6 +266,28 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
             else:
                 total += min_tokens
 
+    elif strategy == "minimax_m3":
+        mm_patch = 14
+        mm_merge = 2
+        mm_factor = mm_patch * mm_merge  # 28
+        mm_max_pixels = 451584
+        mm_min_pixels = 4 * mm_factor * mm_factor  # 3136
+        min_tokens = 1
+
+        for item in items:
+            w = item.get("width")
+            h = item.get("height")
+            if w and h:
+                resized_h, resized_w = _smart_resize(
+                    h, w, mm_factor,
+                    min_pixels=mm_min_pixels, max_pixels=mm_max_pixels,
+                )
+                grid_h = resized_h // mm_patch
+                grid_w = resized_w // mm_patch
+                total += (grid_h * grid_w) // (mm_merge ** 2)
+            else:
+                total += min_tokens
+
     elif strategy == "glm4v":
         grid_length = image_size // patch_size // 2
         num_image_tokens = grid_length * grid_length + 2
