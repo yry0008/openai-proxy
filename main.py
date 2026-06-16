@@ -394,11 +394,26 @@ async def chat_completions(req:dict,request: Request):
             if 'continuous_usage_stats' in body['stream_options']:      
                 del body['stream_options']['continuous_usage_stats']
 
+        # 统一解析 thinking 参数，兼容多种平台规范
+        enable_thinking = None  # None = 不设置（维持模型默认）
         thinking = body.get("thinking", None)
         if isinstance(thinking, dict):
-            enable_thinking = str(thinking.get("type", "")).lower() != "disabled"
+            thinking_type = str(thinking.get("type", "")).lower()
+            if thinking_type == "enabled":
+                enable_thinking = True
+            elif thinking_type == "disabled":
+                enable_thinking = False
+            # 其他值不设置，维持模型默认
+        # 顶层 enable_thinking（阿里/Qwen 规范），优先级低于 thinking dict
+        if enable_thinking is None and "enable_thinking" in body:
+            enable_thinking = bool(body["enable_thinking"])
+        # 写入 SGLang 格式
+        if enable_thinking is not None:
             chat_template_kwargs = body.setdefault("chat_template_kwargs", {})
             chat_template_kwargs["enable_thinking"] = enable_thinking
+        # 消费后删除，避免透传到上游引发不兼容
+        body.pop("thinking", None)
+        body.pop("enable_thinking", None)
 
         guard_result = await token_guard.check(body, body_bytes)
         if guard_result.error:
