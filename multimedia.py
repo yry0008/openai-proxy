@@ -3,11 +3,19 @@
 import asyncio
 import base64
 import logging
+import math
 import mimetypes
-from math import ceil
+from io import BytesIO
 from typing import Any, Optional
 
 import aiohttp
+
+try:
+    from PIL import Image as _pil_image
+    _has_pil = True
+except ImportError:
+    _pil_image = None
+    _has_pil = False
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +27,44 @@ __all__ = [
     "_estimate_multimedia_tokens",
     "_download_image_as_base64",
     "_resolve_image_urls",
+    "_smart_resize",
 ]
+
+
+def _get_image_dimensions(url: str) -> tuple[int | None, int | None]:
+    if not _has_pil or _pil_image is None or not url.startswith("data:image"):
+        return None, None
+    try:
+        _, b64_data = url.split("base64,", 1)
+        raw = base64.b64decode(b64_data)
+        with _pil_image.open(BytesIO(raw)) as img:
+            return img.size[0], img.size[1]
+    except Exception:
+        return None, None
+
+
+def _smart_resize(
+    height: int, width: int, factor: int,
+    min_pixels: int | None = None, max_pixels: int | None = None,
+) -> tuple[int, int]:
+    if max_pixels is None:
+        max_pixels = 16384 * factor * factor
+    if min_pixels is None:
+        min_pixels = 4 * factor * factor
+
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = max(factor, math.ceil(height * beta / factor) * factor)
+        w_bar = max(factor, math.ceil(width * beta / factor) * factor)
+
+    return h_bar, w_bar
 
 
 def _is_multimedia_part(part: Any) -> bool:
@@ -107,12 +152,8 @@ def _extract_multimedia_info(messages: list[dict]) -> list[dict]:
             part_type = str(part.get("type", "")).lower()
             if part_type == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
-                items.append({
-                    "type": "image",
-                    "url": url,
-                    "width": None,
-                    "height": None,
-                })
+                w, h = _get_image_dimensions(url)
+                items.append({"type": "image", "url": url, "width": w, "height": h})
             elif "image" in part_type and part_type != "image_url":
                 url = ""
                 image_data = part.get("image_url") or part.get("url")
@@ -120,21 +161,11 @@ def _extract_multimedia_info(messages: list[dict]) -> list[dict]:
                     url = image_data.get("url", "")
                 elif isinstance(image_data, str):
                     url = image_data
-                items.append({
-                    "type": "image",
-                    "url": url,
-                    "width": None,
-                    "height": None,
-                })
+                w, h = _get_image_dimensions(url)
+                items.append({"type": "image", "url": url, "width": w, "height": h})
             elif part_type == "video_url":
                 url = (part.get("video_url") or {}).get("url", "")
-                items.append({
-                    "type": "video",
-                    "url": url,
-                    "width": None,
-                    "height": None,
-                    "num_frames": None,
-                })
+                items.append({"type": "video", "url": url, "width": None, "height": None, "num_frames": None})
             elif "video" in part_type and part_type != "video_url":
                 url = ""
                 video_data = part.get("video_url") or part.get("url")
@@ -142,13 +173,7 @@ def _extract_multimedia_info(messages: list[dict]) -> list[dict]:
                     url = video_data.get("url", "")
                 elif isinstance(video_data, str):
                     url = video_data
-                items.append({
-                    "type": "video",
-                    "url": url,
-                    "width": None,
-                    "height": None,
-                    "num_frames": None,
-                })
+                items.append({"type": "video", "url": url, "width": None, "height": None, "num_frames": None})
     return items
 
 
@@ -157,10 +182,10 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
     if not strategy or strategy == "none":
         return 0
 
-    patch_size = config.get("patch_size", 14)
+    patch_size = config.get("patch_size", 16)
     merge_size = config.get("merge_size", 2)
     temporal_patch_size = config.get("temporal_patch_size", 2)
-    max_pixels = config.get("max_pixels", 14336)
+    max_pixels = config.get("max_pixels", 0)
     image_size = config.get("image_size", 448)
     max_image_tokens = config.get("max_image_tokens", 2048)
 
@@ -168,32 +193,30 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
 
     if strategy == "qwen3_vl":
         factor = patch_size * merge_size
+        default_max_pixels = 16384 * factor * factor
+        default_min_pixels = 4 * factor * factor
+        eff_max_pixels = max_pixels if max_pixels else default_max_pixels
+        eff_min_pixels = config.get("min_pixels", 0) or default_min_pixels
+        min_tokens = 4
+
         for item in items:
             w = item.get("width")
             h = item.get("height")
             if w and h:
-                resized_h = max(factor, ceil(h / factor) * factor)
-                resized_w = max(factor, ceil(w / factor) * factor)
-                if resized_h * resized_w > max_pixels:
-                    scale = (max_pixels / (resized_h * resized_w)) ** 0.5
-                    new_h = max(factor, ceil(resized_h * scale / factor) * factor)
-                    new_w = max(factor, ceil(resized_w * scale / factor) * factor)
-                    resized_h = new_h
-                    resized_w = new_w
+                resized_h, resized_w = _smart_resize(
+                    h, w, factor,
+                    min_pixels=eff_min_pixels, max_pixels=eff_max_pixels,
+                )
                 grid_h = resized_h // patch_size
                 grid_w = resized_w // patch_size
                 if item["type"] == "image":
                     grid_t = 1
                 else:
                     num_frames = item.get("num_frames") or 1
-                    grid_t = max(ceil(num_frames / temporal_patch_size), 1)
+                    grid_t = max(math.ceil(num_frames / temporal_patch_size), 1)
                 total += (grid_t * grid_h * grid_w) // (merge_size ** 2)
             else:
-                max_grid = max_pixels // (factor * factor)
-                if item["type"] == "image":
-                    total += max_grid // (merge_size ** 2)
-                else:
-                    total += max_image_tokens
+                total += min_tokens
 
     elif strategy == "kimi_k25":
         for item in items:

@@ -44,11 +44,11 @@ REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in (
 VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
 VL_CONFIG = {
     "strategy": VL_TOKEN_STRATEGY,
-    "patch_size": int(os.getenv("VL_PATCH_SIZE", "14")),
+    "patch_size": int(os.getenv("VL_PATCH_SIZE", "16")),
     "merge_size": int(os.getenv("VL_MERGE_SIZE", "2")),
     "temporal_patch_size": int(os.getenv("VL_TEMPORAL_PATCH_SIZE", "2")),
-    "min_pixels": int(os.getenv("VL_MIN_PIXELS", "7168")),
-    "max_pixels": int(os.getenv("VL_MAX_PIXELS", "14336")),
+    "min_pixels": int(os.getenv("VL_MIN_PIXELS", "4096")),
+    "max_pixels": int(os.getenv("VL_MAX_PIXELS", str(16384 * 32 * 32))),
     "image_size": int(os.getenv("VL_IMAGE_SIZE", "448")),
     "max_image_tokens": int(os.getenv("VL_MAX_IMAGE_TOKENS", "2048")),
 }

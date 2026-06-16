@@ -55,7 +55,9 @@ class TokenGuard:
     async def check(self, body: dict, body_bytes: bytes) -> TokenGuardResult:
         chat_flag = "messages" in body
 
-        # 检测多媒体内容并拒绝
+        if chat_flag and self._session:
+            body["messages"] = await _resolve_image_urls(self._session, body["messages"])
+
         if self._reject_multimedia and chat_flag:
             multimedia_items = _extract_multimedia_info(body["messages"])
             if multimedia_items:
@@ -71,9 +73,6 @@ class TokenGuard:
                 )
 
         input_tokens = await self._calculate_input_tokens(body, body_bytes, chat_flag)
-
-        if chat_flag and self._session:
-            body["messages"] = await _resolve_image_urls(self._session, body["messages"])
 
         logger.info(
             "Request input_tokens=%d, requested_output_tokens=%s, stream=%s",

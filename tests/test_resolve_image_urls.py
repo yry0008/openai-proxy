@@ -1,0 +1,163 @@
+"""Smoke tests for image URL resolution in chat messages.
+
+Verifies that HTTP image URLs in OpenAI chat completion format
+are replaced with base64 data URLs by _resolve_image_urls.
+"""
+import base64
+
+import aiohttp
+import pytest
+import pytest_asyncio
+
+from multimedia import _resolve_image_urls
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAABJRUEFTkSuQmCC"
+)
+
+
+@pytest_asyncio.fixture
+async def image_server():
+    async def handler(request):
+        return aiohttp.web.Response(body=PNG_1X1, content_type="image/png")
+
+    app = aiohttp.web.Application()
+    app.router.add_get("/image.png", handler)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield f"http://127.0.0.1:{port}/image.png"
+    await runner.cleanup()
+
+
+@pytest_asyncio.fixture
+async def session():
+    async with aiohttp.ClientSession() as s:
+        yield s
+
+
+class TestResolveImageUrls:
+    @pytest.mark.asyncio
+    async def test_http_image_url_replaced_with_base64(self, session, image_server):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server},
+                    },
+                ],
+            }
+        ]
+        result = await _resolve_image_urls(session, messages)
+        url = result[0]["content"][1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_base64_url_unchanged(self, session):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBOR"},
+                    },
+                ],
+            }
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result[0]["content"][0]["image_url"]["url"] == "data:image/png;base64,iVBOR"
+
+    @pytest.mark.asyncio
+    async def test_no_images_returns_same_messages(self, session):
+        messages = [
+            {"role": "user", "content": "Just text"},
+            {"role": "assistant", "content": "Reply"},
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result == messages
+
+    @pytest.mark.asyncio
+    async def test_text_parts_preserved(self, session, image_server):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server},
+                    },
+                    {"type": "text", "text": "in detail"},
+                ],
+            }
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result[0]["content"][0]["type"] == "text"
+        assert result[0]["content"][0]["text"] == "Describe this"
+        assert result[0]["content"][2]["type"] == "text"
+        assert result[0]["content"][2]["text"] == "in detail"
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_in_one_message(self, session, image_server):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server},
+                    },
+                ],
+            }
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result[0]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert result[0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_string_content_unchanged(self, session, image_server):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server},
+                    },
+                ],
+            },
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result[0]["content"] == "Hello"
+        assert result[1]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_other_message_keys_preserved(self, session, image_server):
+        messages = [
+            {
+                "role": "user",
+                "name": "test_user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_server, "detail": "high"},
+                    },
+                ],
+            }
+        ]
+        result = await _resolve_image_urls(session, messages)
+        assert result[0]["role"] == "user"
+        assert result[0]["name"] == "test_user"
+        assert result[0]["content"][0]["image_url"]["detail"] == "high"
