@@ -115,7 +115,7 @@ class AsyncBatchTokenizer:
 def _resolve_model_max_context(model_id: str, tokenizer: Any) -> int | None:
     max_context = None
     try:
-        model_config = AutoConfig.from_pretrained(model_id)
+        model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         raw_max_context = getattr(model_config, "max_position_embeddings", None)
         if isinstance(raw_max_context, int) and raw_max_context > 0:
             max_context = raw_max_context

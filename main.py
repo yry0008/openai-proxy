@@ -39,6 +39,7 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
 
 MODEL_ID = os.getenv("MODEL_ID", "").strip()
+MODEL_MAX_CONTEXT = int(os.getenv("MODEL_MAX_CONTEXT", "0"))
 REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
 REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in ("true", "1", "yes")
 VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
@@ -81,9 +82,12 @@ async def startup():
     if MODEL_ID and HAS_TOKENIZER:
         from transformers import AutoTokenizer
         from tokenizer import AsyncBatchTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, trust_remote_code=True)
         if tokenizer.chat_template is not None:
-            model_max_context = _resolve_model_max_context(MODEL_ID, tokenizer)
+            if MODEL_MAX_CONTEXT > 0:
+                model_max_context = MODEL_MAX_CONTEXT
+            else:
+                model_max_context = _resolve_model_max_context(MODEL_ID, tokenizer)
             batch_tokenizer = AsyncBatchTokenizer(tokenizer)
             await batch_tokenizer.start()
             logger.info(f"Loaded tokenizer for {MODEL_ID} — using accurate token counting for chat requests")
