@@ -36,14 +36,14 @@ class TokenGuard:
         batch_tokenizer: AsyncBatchTokenizer | None,
         model_max_context: int | None,
         reasoning_type: str,
-        strip_multimedia: bool,
+        reject_multimedia: bool,
         vl_config: dict,
         aiohttp_session: aiohttp.ClientSession | None = None,
     ):
         self._batch_tokenizer = batch_tokenizer
         self._model_max_context = model_max_context
         self._reasoning_parser = _get_reasoning_parser(reasoning_type) if reasoning_type else None
-        self._strip_multimedia = strip_multimedia
+        self._reject_multimedia = reject_multimedia
         self._vl_config = vl_config
         self._vl_strategy = vl_config.get("strategy", "")
         self._session = aiohttp_session
@@ -54,9 +54,25 @@ class TokenGuard:
 
     async def check(self, body: dict, body_bytes: bytes) -> TokenGuardResult:
         chat_flag = "messages" in body
+
+        # 检测多媒体内容并拒绝
+        if self._reject_multimedia and chat_flag:
+            multimedia_items = _extract_multimedia_info(body["messages"])
+            if multimedia_items:
+                logger.info("Rejected request: multimedia content detected (%d item(s))", len(multimedia_items))
+                return TokenGuardResult(
+                    input_tokens=0,
+                    error={
+                        "error": {
+                            "message": "Multimedia content (images, videos, or audio) is not supported by this model.",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+
         input_tokens = await self._calculate_input_tokens(body, body_bytes, chat_flag)
 
-        if not self._strip_multimedia and chat_flag and self._batch_tokenizer is not None and self._session:
+        if chat_flag and self._session:
             body["messages"] = await _resolve_image_urls(self._session, body["messages"])
 
         logger.info(
@@ -93,9 +109,6 @@ class TokenGuard:
             )
         else:
             input_tokens = text_tokens
-
-        if self._strip_multimedia:
-            body["messages"] = messages_for_counting
 
         return input_tokens
 

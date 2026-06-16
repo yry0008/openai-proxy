@@ -40,7 +40,7 @@ CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
 
 MODEL_ID = os.getenv("MODEL_ID", "").strip()
 REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
-STRIP_MULTIMEDIA = os.getenv("STRIP_MULTIMEDIA", "true").strip().lower() in ("true", "1", "yes")
+REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in ("true", "1", "yes")
 VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
 VL_CONFIG = {
     "strategy": VL_TOKEN_STRATEGY,
@@ -102,12 +102,12 @@ async def startup():
         batch_tokenizer=batch_tokenizer,
         model_max_context=model_max_context,
         reasoning_type=REASONING_TYPE,
-        strip_multimedia=STRIP_MULTIMEDIA,
+        reject_multimedia=REJECT_MULTIMEDIA,
         vl_config=VL_CONFIG,
         aiohttp_session=client_session,
     )
 
-    logger.info(f"Strip multimedia: {STRIP_MULTIMEDIA}")
+    logger.info(f"Reject multimedia: {REJECT_MULTIMEDIA}")
     if VL_TOKEN_STRATEGY and VL_TOKEN_STRATEGY != "none":
         logger.info(f"VL token estimation strategy: {VL_TOKEN_STRATEGY}")
     else:
