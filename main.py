@@ -4,13 +4,15 @@ import os
 import json
 from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
-from websockets import connect as websocket_connect  # 新增依赖
+from websockets import connect as websocket_connect
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
+from tokenizer import HAS_TOKENIZER, _resolve_model_max_context
+from token_guard import TokenGuard
 import orjson
 
 import asyncio
@@ -29,16 +31,33 @@ MODEL_NAME = os.getenv("MODEL_NAME", "")
 API_KEY = os.getenv("API_KEY", "")
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
-TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"  # WebSocket协议
+TARGET_WS_SCHEME = "wss" if parsed_target.scheme == "https" else "ws"
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))  # 请求超时时间，单位秒
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 3600))
 RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
-CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")  # 自定义上游请求 User-Agent，留空则使用默认
+CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
+
+MODEL_ID = os.getenv("MODEL_ID", "").strip()
+REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
+STRIP_MULTIMEDIA = os.getenv("STRIP_MULTIMEDIA", "true").strip().lower() in ("true", "1", "yes")
+VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
+VL_CONFIG = {
+    "strategy": VL_TOKEN_STRATEGY,
+    "patch_size": int(os.getenv("VL_PATCH_SIZE", "14")),
+    "merge_size": int(os.getenv("VL_MERGE_SIZE", "2")),
+    "temporal_patch_size": int(os.getenv("VL_TEMPORAL_PATCH_SIZE", "2")),
+    "min_pixels": int(os.getenv("VL_MIN_PIXELS", "7168")),
+    "max_pixels": int(os.getenv("VL_MAX_PIXELS", "14336")),
+    "image_size": int(os.getenv("VL_IMAGE_SIZE", "448")),
+    "max_image_tokens": int(os.getenv("VL_MAX_IMAGE_TOKENS", "2048")),
+}
 
 client_session: aiohttp.ClientSession = None
 
 proxy_client: SseProxyClient = None
+
+token_guard: TokenGuard = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,22 +67,57 @@ async def lifespan(app: FastAPI):
 
 
 async def startup():
-    """
-    应用启动时，创建 aiohttp.ClientSession 实例。
-    """
     global client_session
     global proxy_client
+    global token_guard
     logger.info("Starting up and creating aiohttp.ClientSession...")
     client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
     proxy_client = SseProxyClient()
     logger.info("SseProxyClient started.")
 
+    batch_tokenizer = None
+    model_max_context = None
+
+    if MODEL_ID and HAS_TOKENIZER:
+        from transformers import AutoTokenizer
+        from tokenizer import AsyncBatchTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+        if tokenizer.chat_template is not None:
+            model_max_context = _resolve_model_max_context(MODEL_ID, tokenizer)
+            batch_tokenizer = AsyncBatchTokenizer(tokenizer)
+            await batch_tokenizer.start()
+            logger.info(f"Loaded tokenizer for {MODEL_ID} — using accurate token counting for chat requests")
+            if model_max_context is not None:
+                logger.info(f"Model max context length: {model_max_context}")
+            else:
+                logger.warning("Failed to resolve model context length. Context-length guard is disabled.")
+        else:
+            logger.warning(f"Tokenizer for {MODEL_ID} has no chat_template. Falling back to byte-length estimation.")
+    elif MODEL_ID and not HAS_TOKENIZER:
+        logger.warning("MODEL_ID set but transformers not installed. Falling back to byte-length estimation.")
+    else:
+        logger.info("No MODEL_ID set. Using byte-length estimation for token counting.")
+
+    token_guard = TokenGuard(
+        batch_tokenizer=batch_tokenizer,
+        model_max_context=model_max_context,
+        reasoning_type=REASONING_TYPE,
+        strip_multimedia=STRIP_MULTIMEDIA,
+        vl_config=VL_CONFIG,
+        aiohttp_session=client_session,
+    )
+
+    logger.info(f"Strip multimedia: {STRIP_MULTIMEDIA}")
+    if VL_TOKEN_STRATEGY and VL_TOKEN_STRATEGY != "none":
+        logger.info(f"VL token estimation strategy: {VL_TOKEN_STRATEGY}")
+    else:
+        logger.info("VL token estimation: disabled")
+
 async def shutdown():
-    """
-    应用关闭时，优雅地关闭 aiohttp.ClientSession。
-    """
     global client_session
     global proxy_client
+    if token_guard and token_guard.batch_tokenizer:
+        await token_guard.batch_tokenizer.stop()
     if client_session:
         logger.info("Shutting down aiohttp.ClientSession...")
         await client_session.close()
@@ -339,6 +393,16 @@ async def chat_completions(req:dict,request: Request):
         if 'stream_options' in body:                     
             if 'continuous_usage_stats' in body['stream_options']:      
                 del body['stream_options']['continuous_usage_stats']
+
+        thinking = body.get("thinking", None)
+        if isinstance(thinking, dict):
+            enable_thinking = str(thinking.get("type", "")).lower() != "disabled"
+            chat_template_kwargs = body.setdefault("chat_template_kwargs", {})
+            chat_template_kwargs["enable_thinking"] = enable_thinking
+
+        guard_result = await token_guard.check(body, body_bytes)
+        if guard_result.error:
+            return ORJSONResponse(status_code=400, content=guard_result.error)
 
         if client_wants_stream:
             on_stream_start_callback = on_first_chunk_callback
