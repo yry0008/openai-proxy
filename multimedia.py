@@ -67,6 +67,33 @@ def _smart_resize(
     return h_bar, w_bar
 
 
+def _navit_resize_tokens(
+    width: int, height: int,
+    patch_size: int = 14,
+    merge_kernel_size: int = 2,
+    in_patch_limit: int = 16384,
+    patch_limit_on_one_side: int = 512,
+) -> int:
+    s1 = math.sqrt(
+        in_patch_limit
+        / (max(1.0, width // patch_size) * max(1.0, height // patch_size))
+    )
+    s2 = patch_limit_on_one_side * patch_size / width
+    s3 = patch_limit_on_one_side * patch_size / height
+    scale = min(1.0, s1, s2, s3)
+
+    new_w = min(max(1, int(width * scale)), patch_limit_on_one_side * patch_size)
+    new_h = min(max(1, int(height * scale)), patch_limit_on_one_side * patch_size)
+
+    factor = merge_kernel_size * patch_size
+    pad_w = (factor - new_w % factor) % factor
+    pad_h = (factor - new_h % factor) % factor
+
+    token_h = (new_h + pad_h) // factor
+    token_w = (new_w + pad_w) // factor
+    return token_h * token_w
+
+
 def _is_multimedia_part(part: Any) -> bool:
     if not isinstance(part, dict):
         return False
@@ -219,8 +246,25 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
                 total += min_tokens
 
     elif strategy == "kimi_k25":
+        kimi_patch = 14
+        kimi_merge = 2
+        kimi_in_patch_limit = 16384
+        kimi_patch_limit_side = 512
+        min_tokens = 1
+
         for item in items:
-            total += max_image_tokens
+            w = item.get("width")
+            h = item.get("height")
+            if w and h:
+                total += _navit_resize_tokens(
+                    w, h,
+                    patch_size=kimi_patch,
+                    merge_kernel_size=kimi_merge,
+                    in_patch_limit=kimi_in_patch_limit,
+                    patch_limit_on_one_side=kimi_patch_limit_side,
+                )
+            else:
+                total += min_tokens
 
     elif strategy == "glm4v":
         grid_length = image_size // patch_size // 2
