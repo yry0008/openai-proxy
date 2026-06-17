@@ -41,6 +41,7 @@ CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
 MODEL_ID = os.getenv("MODEL_ID", "").strip()
 MODEL_MAX_CONTEXT = int(os.getenv("MODEL_MAX_CONTEXT", "0"))
 REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
+IS_VLLM = os.getenv("IS_VLLM", "false").strip().lower() in ("true", "1", "yes")
 REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in ("true", "1", "yes")
 VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
 VL_CONFIG = {
@@ -112,6 +113,7 @@ async def startup():
     )
 
     logger.info(f"Reject multimedia: {REJECT_MULTIMEDIA}")
+    logger.info(f"IS_VLLM: {IS_VLLM}")
     if VL_TOKEN_STRATEGY and VL_TOKEN_STRATEGY != "none":
         logger.info(f"VL token estimation strategy: {VL_TOKEN_STRATEGY}")
     else:
@@ -224,8 +226,7 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
-def _make_model_replace_hook(original_model: str):
-    """创建 SSE chunk hook，将上游响应中顶层 model 字段替换为客户端请求的原始模型名称。"""
+def _make_model_replace_hook(original_model: str, is_vllm: bool = False):
     def hook(event: bytes) -> bytes:
         lines = event.split(b"\n")
         result = []
@@ -239,8 +240,20 @@ def _make_model_replace_hook(original_model: str):
                 continue
             try:
                 data = orjson.loads(payload)
-                if isinstance(data, dict) and "model" in data:
-                    data["model"] = original_model
+                modified = False
+                if isinstance(data, dict):
+                    if original_model and "model" in data:
+                        data["model"] = original_model
+                        modified = True
+                    if is_vllm:
+                        choices = data.get("choices")
+                        if isinstance(choices, list):
+                            for choice in choices:
+                                delta = choice.get("delta") if isinstance(choice, dict) else None
+                                if isinstance(delta, dict) and "reasoning" in delta and "reasoning_content" not in delta:
+                                    delta["reasoning_content"] = delta.pop("reasoning")
+                                    modified = True
+                if modified:
                     result.append(b"data: " + orjson.dumps(data))
                     continue
             except (orjson.JSONDecodeError, ValueError):
@@ -248,6 +261,24 @@ def _make_model_replace_hook(original_model: str):
             result.append(line)
         return b"\n".join(result)
     return hook
+
+
+def _convert_vllm_response_reasoning(resp_data):
+    if not isinstance(resp_data, dict):
+        return resp_data
+    for choice in resp_data.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message")
+        if isinstance(msg, dict) and "reasoning" in msg and "reasoning_content" not in msg:
+            msg["reasoning_content"] = msg.pop("reasoning")
+    return resp_data
+
+
+def _convert_vllm_request_reasoning(body: dict):
+    for msg in body.get("messages", []):
+        if isinstance(msg, dict) and "reasoning_content" in msg and "reasoning" not in msg:
+            msg["reasoning"] = msg.pop("reasoning_content")
 
 async def on_request_complete_callback(result:RequestResult,data):
     logger.info(f"Request {result.request_id} completed with status {result.status}.")
@@ -419,6 +450,9 @@ async def chat_completions(req:dict,request: Request):
         body.pop("thinking", None)
         body.pop("enable_thinking", None)
 
+        if IS_VLLM:
+            _convert_vllm_request_reasoning(body)
+
         guard_result = await token_guard.check(body, body_bytes)
         if guard_result.error:
             return ORJSONResponse(status_code=400, content=guard_result.error)
@@ -463,10 +497,11 @@ async def chat_completions(req:dict,request: Request):
 
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
         if client_wants_stream:
+            needs_hook = bool(original_model) or IS_VLLM
             return StreamingResponse(
                 proxy_client.stream_generator(
                     req_id,
-                    chunk_hook=_make_model_replace_hook(original_model) if original_model else None
+                    chunk_hook=_make_model_replace_hook(original_model, is_vllm=IS_VLLM) if needs_hook else None
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -483,14 +518,20 @@ async def chat_completions(req:dict,request: Request):
                 return b"".join(chunks)
             
             full_body = await collect_response()
-            if original_model:
-                try:
-                    resp_data = orjson.loads(full_body)
-                    if isinstance(resp_data, dict) and "model" in resp_data:
+            try:
+                resp_data = orjson.loads(full_body)
+                if isinstance(resp_data, dict):
+                    modified = False
+                    if original_model and "model" in resp_data:
                         resp_data["model"] = original_model
+                        modified = True
+                    if IS_VLLM:
+                        resp_data = _convert_vllm_response_reasoning(resp_data)
+                        modified = True
+                    if modified:
                         full_body = orjson.dumps(resp_data)
-                except Exception:
-                    pass
+            except Exception:
+                pass
             return Response(content=full_body, media_type="application/json")
 
     except HttpErrorWithContent:

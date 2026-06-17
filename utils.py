@@ -20,16 +20,20 @@ def _transform_messages_for_template(messages: list[dict]) -> list[dict]:
         if "tool_calls" in msg:
             transformed_calls = []
             for tc in msg["tool_calls"]:
+                func = tc.get("function")
+                if not isinstance(func, dict):
+                    transformed_calls.append(tc)
+                    continue
                 try:
-                    parsed_args = json.loads(tc["function"]["arguments"])
-                except (json.JSONDecodeError, TypeError):
-                    parsed_args = tc["function"]["arguments"]
+                    parsed_args = json.loads(func["arguments"])
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    parsed_args = func.get("arguments")
                 transformed_calls.append(
                     {
                         "type": "function",
-                        "id": tc["id"],
+                        "id": tc.get("id"),
                         "function": {
-                            "name": tc["function"]["name"],
+                            "name": func["name"],
                             "arguments": parsed_args,
                         },
                     }
@@ -44,7 +48,14 @@ def _transform_messages_for_template(messages: list[dict]) -> list[dict]:
 def _transform_tools_for_template(tools: list[dict] | None) -> list[dict] | None:
     if not tools:
         return None
-    return [{k: v for k, v in t["function"].items() if v is not None} for t in tools]
+    result = []
+    for t in tools:
+        func = t.get("function")
+        if isinstance(func, dict):
+            result.append({k: v for k, v in func.items() if v is not None})
+        else:
+            result.append(t)
+    return result
 
 
 def _get_requested_output_tokens(req_data: dict) -> int:
