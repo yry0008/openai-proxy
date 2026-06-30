@@ -266,7 +266,7 @@ def _make_model_replace_hook(original_model: str, is_vllm: bool = False):
 def _convert_vllm_response_reasoning(resp_data):
     if not isinstance(resp_data, dict):
         return resp_data
-    for choice in resp_data.get("choices", []):
+    for choice in resp_data.get("choices") or []:
         if not isinstance(choice, dict):
             continue
         msg = choice.get("message")
@@ -276,7 +276,7 @@ def _convert_vllm_response_reasoning(resp_data):
 
 
 def _convert_vllm_request_reasoning(body: dict):
-    for msg in body.get("messages", []):
+    for msg in body.get("messages") or []:
         if isinstance(msg, dict) and "reasoning_content" in msg and "reasoning" not in msg:
             msg["reasoning"] = msg.pop("reasoning_content")
 
@@ -433,7 +433,7 @@ async def chat_completions(req:dict,request: Request):
         enable_thinking = None  # None = 不设置（维持模型默认）
         thinking = body.get("thinking", None)
         if isinstance(thinking, dict):
-            thinking_type = str(thinking.get("type", "")).lower()
+            thinking_type = str(thinking.get("type") or "").lower()
             if thinking_type == "enabled":
                 enable_thinking = True
             elif thinking_type == "disabled":

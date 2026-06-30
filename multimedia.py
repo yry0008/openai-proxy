@@ -31,8 +31,8 @@ __all__ = [
 ]
 
 
-def _get_image_dimensions(url: str) -> tuple[int | None, int | None]:
-    if not _has_pil or _pil_image is None or not url.startswith("data:image"):
+def _get_image_dimensions(url: str | None) -> tuple[int | None, int | None]:
+    if not url or not _has_pil or _pil_image is None or not url.startswith("data:image"):
         return None, None
     try:
         _, b64_data = url.split("base64,", 1)
@@ -98,7 +98,7 @@ def _is_multimedia_part(part: Any) -> bool:
     if not isinstance(part, dict):
         return False
 
-    part_type = str(part.get("type", "")).lower()
+    part_type = str(part.get("type") or "").lower()
     if part_type and part_type != "text":
         if any(token in part_type for token in ("image", "video", "audio", "file")):
             return True
@@ -154,7 +154,7 @@ def _strip_multimedia_from_messages(messages: list[dict]) -> list[dict]:
             text_parts = [p for p in content if not _is_multimedia_part(p)]
             if text_parts:
                 if len(text_parts) == 1 and isinstance(text_parts[0], dict) and text_parts[0].get("type") == "text":
-                    msg["content"] = text_parts[0].get("text", "")
+                    msg["content"] = text_parts[0].get("text") or ""
                 else:
                     msg["content"] = text_parts
             else:
@@ -176,28 +176,28 @@ def _extract_multimedia_info(messages: list[dict]) -> list[dict]:
         for part in content:
             if not isinstance(part, dict):
                 continue
-            part_type = str(part.get("type", "")).lower()
+            part_type = str(part.get("type") or "").lower()
             if part_type == "image_url":
-                url = (part.get("image_url") or {}).get("url", "")
+                url = (part.get("image_url") or {}).get("url") or ""
                 w, h = _get_image_dimensions(url)
                 items.append({"type": "image", "url": url, "width": w, "height": h})
             elif "image" in part_type and part_type != "image_url":
                 url = ""
                 image_data = part.get("image_url") or part.get("url")
                 if isinstance(image_data, dict):
-                    url = image_data.get("url", "")
+                    url = image_data.get("url") or ""
                 elif isinstance(image_data, str):
                     url = image_data
                 w, h = _get_image_dimensions(url)
                 items.append({"type": "image", "url": url, "width": w, "height": h})
             elif part_type == "video_url":
-                url = (part.get("video_url") or {}).get("url", "")
+                url = (part.get("video_url") or {}).get("url") or ""
                 items.append({"type": "video", "url": url, "width": None, "height": None, "num_frames": None})
             elif "video" in part_type and part_type != "video_url":
                 url = ""
                 video_data = part.get("video_url") or part.get("url")
                 if isinstance(video_data, dict):
-                    url = video_data.get("url", "")
+                    url = video_data.get("url") or ""
                 elif isinstance(video_data, str):
                     url = video_data
                 items.append({"type": "video", "url": url, "width": None, "height": None, "num_frames": None})
@@ -338,10 +338,10 @@ async def _resolve_image_urls(session: aiohttp.ClientSession, messages: list[dic
         for part_idx, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
-            if str(part.get("type", "")).lower() == "image_url":
+            if str(part.get("type") or "").lower() == "image_url":
                 image_url_data = part.get("image_url")
                 if isinstance(image_url_data, dict):
-                    url = image_url_data.get("url", "")
+                    url = image_url_data.get("url") or ""
                     if url.startswith("http://") or url.startswith("https://"):
                         task_idx = len(download_tasks)
                         download_tasks.append(_download_image_as_base64(session, url))

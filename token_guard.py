@@ -56,7 +56,8 @@ class TokenGuard:
         chat_flag = "messages" in body
 
         if chat_flag and self._session:
-            body["messages"] = await _resolve_image_urls(self._session, body["messages"])
+            messages_list = body.get("messages") or []
+            body["messages"] = await _resolve_image_urls(self._session, messages_list)
 
         if self._reject_multimedia and chat_flag:
             multimedia_items = _extract_multimedia_info(body["messages"])
@@ -88,8 +89,8 @@ class TokenGuard:
         if not chat_flag or self._batch_tokenizer is None:
             return len(body_bytes) // 4
 
-        multimedia_items = _extract_multimedia_info(body["messages"])
-        messages_for_counting = _strip_multimedia_from_messages(body["messages"])
+        multimedia_items = _extract_multimedia_info(body.get("messages") or [])
+        messages_for_counting = _strip_multimedia_from_messages(body.get("messages") or [])
         messages = _transform_messages_for_template(messages_for_counting)
 
         if self._reasoning_parser is not None:
@@ -100,11 +101,10 @@ class TokenGuard:
 
         if multimedia_items and self._vl_strategy and self._vl_strategy not in ("none", ""):
             multimedia_tokens = _estimate_multimedia_tokens(multimedia_items, self._vl_config)
-            adjusted_multimedia_tokens = int(multimedia_tokens * 0.95)
-            input_tokens = text_tokens + adjusted_multimedia_tokens
+            input_tokens = text_tokens + multimedia_tokens
             logger.info(
-                "VL token estimation: strategy=%s, text_tokens=%d, multimedia_tokens=%d, adjusted=%d, total=%d",
-                self._vl_strategy, text_tokens, multimedia_tokens, adjusted_multimedia_tokens, input_tokens,
+                "VL token estimation: strategy=%s, text_tokens=%d, multimedia_tokens=%d, total=%d",
+                self._vl_strategy, text_tokens, multimedia_tokens, input_tokens,
             )
         else:
             input_tokens = text_tokens
