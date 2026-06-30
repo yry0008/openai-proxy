@@ -12,7 +12,7 @@ __all__ = [
 def _transform_messages_for_template(messages: list[dict]) -> list[dict]:
     result = []
     for msg in messages:
-        d = {"role": msg["role"], "content": msg.get("content") or ""}
+        d = {"role": msg.get("role", "user"), "content": msg.get("content") or ""}
         if "name" in msg:
             d["name"] = msg["name"]
         if "tool_call_id" in msg:
@@ -33,7 +33,7 @@ def _transform_messages_for_template(messages: list[dict]) -> list[dict]:
                         "type": "function",
                         "id": tc.get("id"),
                         "function": {
-                            "name": func["name"],
+                            "name": func.get("name", ""),
                             "arguments": parsed_args,
                         },
                     }
