@@ -36,9 +36,47 @@ RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")  # 自定义上游请求 User-Agent，留空则使用默认
 
+# 源进源出: 启用后出站请求绑定到客户端连接到的本地IP
+SOURCE_IP_BINDING = os.getenv("SOURCE_IP_BINDING", "0") == "1"
+# 监听端口 (可通过环境变量覆盖)
+LISTEN_PORT = int(os.getenv("LISTEN_PORT", "3280"))
+
 client_session: aiohttp.ClientSession = None
 
 proxy_client: SseProxyClient = None
+
+# 源进源出: 按本地IP缓存的出站会话 (reverse_proxy 路径)
+source_ip_sessions: dict[str, aiohttp.ClientSession] = {}
+
+
+def get_inbound_local_ip(request) -> str | None:
+    """返回客户端连接到的本地IP (scope["server"][0])，用于源进源出绑定。
+
+    无法获取或为通配地址时返回 None。兼容 Request 和 WebSocket。
+    """
+    server = request.scope.get("server")
+    if not server or len(server) < 1:
+        return None
+    ip = server[0]
+    if not ip or ip in ("0.0.0.0", "::"):
+        return None
+    return ip
+
+
+async def get_reverse_proxy_session(local_ip: str | None) -> aiohttp.ClientSession:
+    """返回 reverse_proxy 路径所需的出站会话。
+
+    源进源出启用且 local_ip 可用时，返回绑定到该IP的缓存会话；
+    否则返回全局默认 client_session。
+    """
+    global client_session
+    if not SOURCE_IP_BINDING or local_ip is None:
+        return client_session
+    session = source_ip_sessions.get(local_ip)
+    if session is None or session.closed:
+        connector = aiohttp.TCPConnector(local_addr=(local_ip, 0))
+        source_ip_sessions[local_ip] = aiohttp.ClientSession(connector=connector)
+    return source_ip_sessions[local_ip]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,9 +102,13 @@ async def shutdown():
     """
     global client_session
     global proxy_client
+    global source_ip_sessions
     if client_session:
         logger.info("Shutting down aiohttp.ClientSession...")
         await client_session.close()
+    for session in source_ip_sessions.values():
+        await session.close()
+    source_ip_sessions.clear()
     if proxy_client:
         logger.info("Shutting down SseProxyClient...")
         await proxy_client.close()
@@ -98,8 +140,15 @@ async def pass_ws_request(websocket: WebSocket, path: str):
     if websocket.url.query:
         target_ws_url += f"?{websocket.url.query}"
 
+    ssl_val = False if TARGET_WS_SCHEME == "wss" else None
+    local_ip = get_inbound_local_ip(websocket) if SOURCE_IP_BINDING else None
+    if local_ip:
+        ws_connect = websocket_connect(target_ws_url, ssl=ssl_val, local_addr=(local_ip, 0))
+    else:
+        ws_connect = websocket_connect(target_ws_url, ssl=ssl_val)
+
     # 建立到目标服务器的 WebSocket 连接
-    async with websocket_connect(target_ws_url,ssl=False if TARGET_WS_SCHEME == "wss" else None) as target_ws:
+    async with ws_connect as target_ws:
         # 双向数据转发
         while True:
             try:
@@ -270,7 +319,8 @@ async def chat_responses(req:dict, request: Request):
             on_stream_start=on_stream_start_callback,
             on_success=on_request_complete_callback,
             on_failure=on_request_error_callback,
-            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS
+            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS,
+            source_ip=get_inbound_local_ip(request) if SOURCE_IP_BINDING else None,
         )
 
         # 1. 提交任务
@@ -364,7 +414,8 @@ async def chat_completions(req:dict,request: Request):
             on_stream_start=on_stream_start_callback,
             on_success=on_request_complete_callback,
             on_failure=on_request_error_callback,
-            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS
+            cancel_behavior=CancelBehavior.TRIGGER_SUCCESS,
+            source_ip=get_inbound_local_ip(request) if SOURCE_IP_BINDING else None,
         )
 
         # 1. 提交任务
@@ -423,7 +474,6 @@ async def chat_completions(req:dict,request: Request):
     "PATCH", "HEAD", "OPTIONS"
 ])
 async def reverse_proxy(request: Request, path: str):
-    global client_session
     # 构建目标URL
     # 根据 STRIP_V1_PREFIX 配置决定是否去掉 v1/ 前缀
     if STRIP_V1_PREFIX and path.startswith('v1/'):
@@ -475,8 +525,10 @@ async def reverse_proxy(request: Request, path: str):
     timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=300)  # 5分钟超时，适用于长时间流式响应
 
     try:
-        # 使用aiohttp发送请求
-        response = await client_session.request(
+        session = await get_reverse_proxy_session(
+            get_inbound_local_ip(request) if SOURCE_IP_BINDING else None
+        )
+        response = await session.request(
             method=request.method,
             url=target_url,
             headers=request_headers,
@@ -516,6 +568,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=3280,
+        port=LISTEN_PORT,
         workers=workers,
     )

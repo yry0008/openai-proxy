@@ -27,8 +27,9 @@ EXPOSE 3280
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3280/health || exit 1
+    CMD curl -f http://localhost:${LISTEN_PORT:-3280}/health || exit 1
 
-# 启动应用（通过环境变量 WORKERS 控制进程数，默认 1）
+# 启动应用（通过环境变量 WORKERS 控制进程数，默认 1；LISTEN_PORT 控制端口，默认 3280）
 ENV WORKERS=${WORKERS:-1}
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 3280 --workers ${WORKERS}"]
+ENV LISTEN_PORT=${LISTEN_PORT:-3280}
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${LISTEN_PORT} --workers ${WORKERS}"]

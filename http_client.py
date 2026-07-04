@@ -154,6 +154,9 @@ class RequestWrapper:
     data: Any = None                            # 请求体 (raw bytes / str)
     json: Any = None                            # JSON 请求体 (自动 orjson.dumps + Content-Type)
 
+    # ── 源进源出 ──
+    source_ip: Optional[str] = None             # 出站绑定的本地源 IP (None = 系统默认选路)
+
     # ── 回调 ──
     user_data: Any = None                       # 透传给回调的任意上下文数据
     on_stream_start: Optional[OnStreamStartCallback] = None  # 首个有效数据到达后触发，参数 (req_id, ttft, stream_start_data)
@@ -264,20 +267,24 @@ class AsyncHttpClient:
 
     def __init__(self, result_retention_seconds: int = 300):
         self.active_requests: Dict[str, RequestContext] = {}
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.sessions: Dict[str, aiohttp.ClientSession] = {}
         self.result_retention_seconds = result_retention_seconds
         
         self.scheduler = AsyncIOScheduler()
         self.scheduler.add_job(self._garbage_collector, 'interval', seconds=60)
         self.scheduler.start()
 
-    async def get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            # 不设置 json_serialize，我们在 _worker 中手动用 orjson
-            # 取消连接数限制：limit=0 表示无限制
-            connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
-            self.session = aiohttp.ClientSession(connector=connector)
-        return self.session
+    async def get_session(self, source_ip: Optional[str] = None) -> aiohttp.ClientSession:
+        key = source_ip or ""
+        session = self.sessions.get(key)
+        if session is None or session.closed:
+            kwargs: Dict[str, Any] = {"limit": 0, "limit_per_host": 0}
+            if source_ip:
+                kwargs["local_addr"] = (source_ip, 0)
+            self.sessions[key] = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(**kwargs)
+            )
+        return self.sessions[key]
 
     def submit(self, request: RequestWrapper) -> str:
         """提交请求并返回 request_id。立即返回，请求在后台 _worker 中执行。
@@ -369,7 +376,7 @@ class AsyncHttpClient:
             except Exception:
                 pass
 
-        session = await self.get_session()
+        session = await self.get_session(req.source_ip)
         deadline = time.time() + req.timeout
         
         request_kwargs = {
@@ -767,5 +774,7 @@ class AsyncHttpClient:
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         
-        if self.session: await self.session.close()
+        for session in self.sessions.values():
+            await session.close()
+        self.sessions.clear()
         self.scheduler.shutdown()
