@@ -148,7 +148,7 @@ class TestTransformMessagesToolCalls:
         ]
         result = _transform_messages_for_template(messages)
         tc = result[0]["tool_calls"][0]
-        assert tc["function"]["arguments"] == "not valid json{"
+        assert tc["function"]["arguments"] == {}
 
     def test_tool_calls_missing_arguments_key(self):
         messages = [
@@ -162,7 +162,7 @@ class TestTransformMessagesToolCalls:
         ]
         result = _transform_messages_for_template(messages)
         tc = result[0]["tool_calls"][0]
-        assert tc["function"]["arguments"] is None
+        assert tc["function"]["arguments"] == {}
 
     def test_reasoning_content_preserved(self):
         messages = [
@@ -204,3 +204,96 @@ class TestTransformMessagesToolCalls:
         ]
         result = _transform_messages_for_template(messages)
         assert result[0]["tool_calls"][0]["function"]["arguments"] == {"key": "val"}
+
+
+class TestTransformToolsNonDictFunction:
+    def test_function_str_skipped(self):
+        tools = [{"type": "function", "function": "get_weather"}]
+        result = _transform_tools_for_template(tools)
+        assert result == []
+
+    def test_function_int_skipped(self):
+        tools = [{"type": "function", "function": 123}]
+        result = _transform_tools_for_template(tools)
+        assert result == []
+
+    def test_function_list_skipped(self):
+        tools = [{"type": "function", "function": ["a"]}]
+        result = _transform_tools_for_template(tools)
+        assert result == []
+
+    def test_function_none_preserved(self):
+        tools = [{"type": "function", "function": None}]
+        result = _transform_tools_for_template(tools)
+        assert result == tools
+
+    def test_non_dict_tool_entry_skipped(self):
+        tools = ["just_a_string", {"type": "function", "function": {"name": "f", "parameters": {}}}]
+        result = _transform_tools_for_template(tools)
+        assert result == [{"name": "f", "parameters": {}}]
+
+    def test_malicious_function_str_does_not_leak(self):
+        tools = [
+            {"type": "function", "function": "bad"},
+            {"type": "function", "function": {"name": "good", "parameters": {}}},
+        ]
+        result = _transform_tools_for_template(tools)
+        assert result == [{"name": "good", "parameters": {}}]
+
+
+class TestTransformMessagesNonDictArguments:
+    def test_arguments_json_list_becomes_empty_dict(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "[1,2]"}}
+                ],
+            }
+        ]
+        result = _transform_messages_for_template(messages)
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_arguments_json_int_becomes_empty_dict(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "42"}}
+                ],
+            }
+        ]
+        result = _transform_messages_for_template(messages)
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_arguments_none_becomes_empty_dict(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": None}}
+                ],
+            }
+        ]
+        result = _transform_messages_for_template(messages)
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_arguments_json_dict_still_parsed(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": '{"a": 1}'}}
+                ],
+            }
+        ]
+        result = _transform_messages_for_template(messages)
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}

@@ -28,6 +28,8 @@ def _transform_messages_for_template(messages: list[dict]) -> list[dict]:
                     parsed_args = json.loads(func["arguments"])
                 except (json.JSONDecodeError, TypeError, KeyError):
                     parsed_args = func.get("arguments")
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
                 transformed_calls.append(
                     {
                         "type": "function",
@@ -50,10 +52,12 @@ def _transform_tools_for_template(tools: list[dict] | None) -> list[dict] | None
         return None
     result = []
     for t in tools:
+        if not isinstance(t, dict):
+            continue
         func = t.get("function")
         if isinstance(func, dict):
             result.append({k: v for k, v in func.items() if v is not None})
-        else:
+        elif func is None:
             result.append(t)
     return result
 
