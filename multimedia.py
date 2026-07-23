@@ -5,6 +5,7 @@ import base64
 import logging
 import math
 import mimetypes
+import re
 from io import BytesIO
 from typing import Any, Optional
 
@@ -27,8 +28,22 @@ __all__ = [
     "_estimate_multimedia_tokens",
     "_download_image_as_base64",
     "_resolve_image_urls",
+    "_normalize_data_url",
     "_smart_resize",
 ]
+
+
+_DATA_URL_RE = re.compile(r"^data:([^;,]+).*;base64,(.*)$", re.DOTALL)
+
+
+def _normalize_data_url(url: str) -> str:
+    if not url or not url.startswith("data:"):
+        return url
+    m = _DATA_URL_RE.match(url)
+    if not m:
+        return url
+    mime, b64 = m.group(1), m.group(2)
+    return f"data:{mime};base64,{b64}"
 
 
 def _get_image_dimensions(url: str | None) -> tuple[int | None, int | None]:
@@ -331,48 +346,47 @@ async def _resolve_image_urls(session: aiohttp.ClientSession, messages: list[dic
     download_tasks = []
     location_to_idx = {}
 
-    for msg_idx, msg in enumerate(messages):
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part_idx, part in enumerate(content):
-            if not isinstance(part, dict):
-                continue
-            if str(part.get("type") or "").lower() == "image_url":
-                image_url_data = part.get("image_url")
-                if isinstance(image_url_data, dict):
-                    url = image_url_data.get("url") or ""
-                    if url.startswith("http://") or url.startswith("https://"):
-                        task_idx = len(download_tasks)
-                        download_tasks.append(_download_image_as_base64(session, url))
-                        location_to_idx[(msg_idx, part_idx)] = task_idx
-
-    if not download_tasks:
-        return messages
-
-    results = await asyncio.gather(*download_tasks)
-
     new_messages = []
     for msg_idx, msg in enumerate(messages):
         new_msg = dict(msg)
         content = new_msg.get("content")
-        if isinstance(content, list):
-            new_content = []
-            for part_idx, part in enumerate(content):
-                key = (msg_idx, part_idx)
-                if key in location_to_idx:
-                    new_part = dict(part) if isinstance(part, dict) else part
-                    if isinstance(new_part, dict):
-                        new_part["image_url"] = dict(
-                            new_part.get("image_url") or {}
-                        )
-                        new_part["image_url"]["url"] = results[
-                            location_to_idx[key]
-                        ]
-                    new_content.append(new_part)
-                else:
-                    new_content.append(part)
-            new_msg["content"] = new_content
+        if not isinstance(content, list):
+            new_messages.append(new_msg)
+            continue
+        new_content = []
+        for part_idx, part in enumerate(content):
+            if not isinstance(part, dict) or str(part.get("type") or "").lower() != "image_url":
+                new_content.append(part)
+                continue
+            image_url_data = part.get("image_url")
+            if not isinstance(image_url_data, dict):
+                new_content.append(part)
+                continue
+            url = image_url_data.get("url") or ""
+            if url.startswith("http://") or url.startswith("https://"):
+                task_idx = len(download_tasks)
+                download_tasks.append(_download_image_as_base64(session, url))
+                location_to_idx[(msg_idx, part_idx)] = task_idx
+                new_content.append(part)
+            elif url.startswith("data:"):
+                new_part = dict(part)
+                new_part["image_url"] = dict(image_url_data)
+                new_part["image_url"]["url"] = _normalize_data_url(url)
+                new_content.append(new_part)
+            else:
+                new_content.append(part)
+        new_msg["content"] = new_content
         new_messages.append(new_msg)
+
+    if not download_tasks:
+        return new_messages
+
+    results = await asyncio.gather(*download_tasks)
+
+    for (msg_idx, part_idx), task_idx in location_to_idx.items():
+        new_msg = new_messages[msg_idx]
+        new_part = new_msg["content"][part_idx]
+        new_part["image_url"] = dict(new_part.get("image_url") or {})
+        new_part["image_url"]["url"] = results[task_idx]
 
     return new_messages
