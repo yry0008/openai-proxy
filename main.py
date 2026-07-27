@@ -37,6 +37,36 @@ RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")  # 自定义上游请求 User-Agent，留空则使用默认
 
+MODEL_MAX_CONTEXT = int(os.getenv("MODEL_MAX_CONTEXT", "0"))
+
+
+def _parse_model_context_limits(raw: str) -> dict:
+    """Parse MODEL_CONTEXT_LIMITS as a JSON object mapping model name to max context tokens."""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid MODEL_CONTEXT_LIMITS JSON, ignoring: %r", raw)
+        return {}
+    limits = {}
+    if isinstance(data, dict):
+        for name, value in data.items():
+            try:
+                limit = int(value)
+            except (TypeError, ValueError):
+                logger.warning("Invalid context limit for model %r: %r, skipped", name, value)
+                continue
+            if limit <= 0:
+                logger.warning("Non-positive context limit for model %r: %d, skipped", name, limit)
+                continue
+            limits[str(name)] = limit
+    return limits
+
+
+# 按客户端请求的模型名限制 context size（JSON 映射，未列出的模型回退到 MODEL_MAX_CONTEXT）
+MODEL_CONTEXT_LIMITS = _parse_model_context_limits(os.getenv("MODEL_CONTEXT_LIMITS", ""))
+
 # 源进源出: 启用后出站请求绑定到客户端连接到的本地IP
 SOURCE_IP_BINDING = os.getenv("SOURCE_IP_BINDING", "0") == "1"
 # 监听端口 (可通过环境变量覆盖)
@@ -96,6 +126,10 @@ async def startup():
     client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
     proxy_client = SseProxyClient()
     logger.info("SseProxyClient started.")
+    if MODEL_MAX_CONTEXT > 0:
+        logger.info(f"Model max context length: {MODEL_MAX_CONTEXT}")
+    if MODEL_CONTEXT_LIMITS:
+        logger.info(f"Model-specific context limits: {MODEL_CONTEXT_LIMITS}")
 
 async def shutdown():
     """
@@ -271,6 +305,50 @@ async def auto_disconnect_connection(raw_request: Request, upstream_request_id: 
     except asyncio.CancelledError:
         return
 
+
+def _get_requested_output_tokens(body: dict) -> int:
+    requested = body.get("max_tokens")
+    if requested is None:
+        requested = body.get("max_completion_tokens", 16)
+    if requested is None:
+        requested = 16
+    try:
+        return max(0, int(requested))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _check_context_length(model: str, body: dict, body_bytes: bytes) -> dict | None:
+    """按输入模型检查 context 长度，超限返回错误 dict，否则返回 None。
+
+    无 tokenizer 基础设施，input_tokens 使用字节数 / 4 估算。
+    """
+    max_context = MODEL_CONTEXT_LIMITS.get(model) if model else None
+    if max_context is None:
+        max_context = MODEL_MAX_CONTEXT if MODEL_MAX_CONTEXT > 0 else None
+    elif max_context != MODEL_MAX_CONTEXT:
+        logger.info("Applying model-specific context limit for %s: %d", model, max_context)
+    if max_context is None:
+        return None
+
+    input_tokens = len(body_bytes) // 4
+    requested_output_tokens = _get_requested_output_tokens(body)
+    total_tokens = input_tokens + requested_output_tokens
+    if total_tokens > max_context:
+        return {
+            "error": {
+                "message": (
+                    f"This model's maximum context length is {max_context} tokens. "
+                    f"However, you requested {requested_output_tokens} output tokens and your prompt contains at least "
+                    f"{input_tokens} input tokens, for a total of at least {total_tokens} tokens. "
+                    "Please reduce the length of the input prompt or the number of requested output tokens."
+                ),
+                "type": "invalid_request_error",
+            }
+        }
+    return None
+
+
 @app.post("/v1/responses")
 async def chat_responses(req:dict, request: Request):
     """
@@ -398,6 +476,11 @@ async def chat_completions(req:dict,request: Request):
         if 'stream_options' in body:                     
             if 'continuous_usage_stats' in body['stream_options']:      
                 del body['stream_options']['continuous_usage_stats']
+
+        # 按输入模型检查 context 长度限制
+        context_error = _check_context_length(original_model, body, body_bytes)
+        if context_error:
+            return ORJSONResponse(status_code=400, content=context_error)
 
         if client_wants_stream:
             on_stream_start_callback = on_first_chunk_callback
