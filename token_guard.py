@@ -39,9 +39,11 @@ class TokenGuard:
         reject_multimedia: bool,
         vl_config: dict,
         aiohttp_session: aiohttp.ClientSession | None = None,
+        model_context_limits: dict | None = None,
     ):
         self._batch_tokenizer = batch_tokenizer
         self._model_max_context = model_max_context
+        self._model_context_limits = model_context_limits or {}
         self._reasoning_parser = _get_reasoning_parser(reasoning_type) if reasoning_type else None
         self._reject_multimedia = reject_multimedia
         self._vl_config = vl_config
@@ -52,7 +54,7 @@ class TokenGuard:
     def batch_tokenizer(self) -> AsyncBatchTokenizer | None:
         return self._batch_tokenizer
 
-    async def check(self, body: dict, body_bytes: bytes) -> TokenGuardResult:
+    async def check(self, body: dict, body_bytes: bytes, model: str = "") -> TokenGuardResult:
         chat_flag = "messages" in body
 
         if chat_flag and self._session:
@@ -82,7 +84,7 @@ class TokenGuard:
             body.get("stream", False),
         )
 
-        error = self._check_context_length(input_tokens, body)
+        error = self._check_context_length(input_tokens, body, model)
         return TokenGuardResult(input_tokens=input_tokens, error=error)
 
     async def _calculate_input_tokens(self, body: dict, body_bytes: bytes, chat_flag: bool) -> int:
@@ -111,17 +113,22 @@ class TokenGuard:
 
         return input_tokens
 
-    def _check_context_length(self, input_tokens: int, body: dict) -> Optional[dict]:
-        if self._model_max_context is None:
+    def _check_context_length(self, input_tokens: int, body: dict, model: str = "") -> Optional[dict]:
+        max_context = self._model_context_limits.get(model) if model else None
+        if max_context is None:
+            max_context = self._model_max_context
+        elif max_context != self._model_max_context:
+            logger.info("Applying model-specific context limit for %s: %d", model, max_context)
+        if max_context is None:
             return None
 
         requested_output_tokens = _get_requested_output_tokens(body)
         total_tokens = input_tokens + requested_output_tokens
-        if total_tokens > self._model_max_context:
+        if total_tokens > max_context:
             return {
                 "error": {
                     "message": _build_context_length_error(
-                        self._model_max_context, requested_output_tokens, input_tokens,
+                        max_context, requested_output_tokens, input_tokens,
                     ),
                     "type": "invalid_request_error",
                 }

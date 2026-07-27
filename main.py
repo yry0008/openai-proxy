@@ -40,6 +40,33 @@ CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
 
 MODEL_ID = os.getenv("MODEL_ID", "").strip()
 MODEL_MAX_CONTEXT = int(os.getenv("MODEL_MAX_CONTEXT", "0"))
+
+
+def _parse_model_context_limits(raw: str) -> dict:
+    """Parse MODEL_CONTEXT_LIMITS as a JSON object mapping model name to max context tokens."""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid MODEL_CONTEXT_LIMITS JSON, ignoring: %r", raw)
+        return {}
+    limits = {}
+    if isinstance(data, dict):
+        for name, value in data.items():
+            try:
+                limit = int(value)
+            except (TypeError, ValueError):
+                logger.warning("Invalid context limit for model %r: %r, skipped", name, value)
+                continue
+            if limit <= 0:
+                logger.warning("Non-positive context limit for model %r: %d, skipped", name, limit)
+                continue
+            limits[str(name)] = limit
+    return limits
+
+
+MODEL_CONTEXT_LIMITS = _parse_model_context_limits(os.getenv("MODEL_CONTEXT_LIMITS", ""))
 REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
 IS_VLLM = os.getenv("IS_VLLM", "false").strip().lower() in ("true", "1", "yes")
 REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in ("true", "1", "yes")
@@ -110,7 +137,11 @@ async def startup():
         reject_multimedia=REJECT_MULTIMEDIA,
         vl_config=VL_CONFIG,
         aiohttp_session=client_session,
+        model_context_limits=MODEL_CONTEXT_LIMITS,
     )
+
+    if MODEL_CONTEXT_LIMITS:
+        logger.info(f"Model-specific context limits: {MODEL_CONTEXT_LIMITS}")
 
     logger.info(f"Reject multimedia: {REJECT_MULTIMEDIA}")
     logger.info(f"IS_VLLM: {IS_VLLM}")
@@ -453,7 +484,7 @@ async def chat_completions(req:dict,request: Request):
         if IS_VLLM:
             _convert_vllm_request_reasoning(body)
 
-        guard_result = await token_guard.check(body, body_bytes)
+        guard_result = await token_guard.check(body, body_bytes, model=original_model)
         if guard_result.error:
             return ORJSONResponse(status_code=400, content=guard_result.error)
 
