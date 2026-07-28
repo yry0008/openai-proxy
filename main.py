@@ -501,7 +501,7 @@ async def chat_completions(req:dict,request: Request):
         # 透传路由头；request.headers 大小写不敏感，任意大小写形式都能匹配
         routing_key = request.headers.get("X-SMG-Routing-Key")
         if routing_key:
-            logger.debug("Received X-SMG-Routing-Key: %s", routing_key)
+            logger.info("Received X-SMG-Routing-Key: %s", routing_key)
             _headers["X-SMG-Routing-Key"] = routing_key
         req_wrapper = RequestWrapper(
             url=target_url,
