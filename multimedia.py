@@ -29,6 +29,8 @@ __all__ = [
     "_download_image_as_base64",
     "_resolve_image_urls",
     "_normalize_data_url",
+    "_validate_image_bytes",
+    "_validate_data_url",
     "_smart_resize",
 ]
 
@@ -56,6 +58,46 @@ def _get_image_dimensions(url: str | None) -> tuple[int | None, int | None]:
             return img.size[0], img.size[1]
     except Exception:
         return None, None
+
+
+def _validate_image_bytes(raw: bytes) -> Optional[str]:
+    """Fully decode image bytes to verify integrity.
+
+    Returns an error description for truncated/corrupt/undecodable data,
+    None when the image decodes cleanly (or PIL is unavailable).
+    """
+    if not raw:
+        return "empty image data"
+    if not _has_pil or _pil_image is None:
+        return None
+    try:
+        with _pil_image.open(BytesIO(raw)) as img:
+            img.load()
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def _validate_data_url(url: str) -> Optional[str]:
+    """Validate the base64 payload of a data:image URL decodes to a complete image.
+
+    Non-image or non-base64 data URLs are skipped (returns None).
+    """
+    m = _DATA_URL_RE.match(url)
+    if not m:
+        return None
+    mime, b64 = m.group(1), m.group(2)
+    if not mime.startswith("image/"):
+        return None
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        return f"invalid base64 payload: {e}"
+    return _validate_image_bytes(raw)
+
+
+def _build_invalid_image_error(message: str) -> dict:
+    return {"error": {"message": message, "type": "invalid_request_error"}}
 
 
 def _smart_resize(
@@ -316,14 +358,21 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
     return total
 
 
-async def _download_image_as_base64(session: aiohttp.ClientSession, url: str) -> str:
+async def _download_image_as_base64(
+    session: aiohttp.ClientSession, url: str
+) -> tuple[str, Optional[str]]:
+    """Download an image and return (data_url_or_original_url, error_detail).
+
+    error_detail is set when the downloaded bytes fail image validation
+    (truncated/corrupt); the request should be rejected in that case.
+    """
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status != 200:
                 logger.warning(
                     "Failed to download image from %s: status %d", url, response.status
                 )
-                return url
+                return url, None
 
             content_type = response.headers.get("content-type", "")
             if not content_type or not content_type.startswith("image/"):
@@ -334,15 +383,30 @@ async def _download_image_as_base64(session: aiohttp.ClientSession, url: str) ->
                     content_type = "image/png"
 
             content = await response.read()
+            invalid = _validate_image_bytes(content)
+            if invalid is not None:
+                logger.warning(
+                    "Invalid image downloaded from %s (%d bytes): %s",
+                    url, len(content), invalid,
+                )
+                return url, invalid
+
             ext = content_type.split("/")[-1] if "/" in content_type else "png"
             b64 = base64.b64encode(content).decode("utf-8")
-            return f"data:image/{ext};base64,{b64}"
+            return f"data:image/{ext};base64,{b64}", None
     except Exception as e:
         logger.warning("Failed to download image from %s: %s", url, e)
-        return url
+        return url, None
 
 
-async def _resolve_image_urls(session: aiohttp.ClientSession, messages: list[dict]) -> list[dict]:
+async def _resolve_image_urls(
+    session: aiohttp.ClientSession, messages: list[dict]
+) -> tuple[list[dict], Optional[dict]]:
+    """Resolve image URLs in messages to base64 data URLs, validating integrity.
+
+    Returns (messages, error). error is None when every image is usable;
+    otherwise it is a 400 error body to return to the client.
+    """
     download_tasks = []
     location_to_idx = {}
 
@@ -369,9 +433,19 @@ async def _resolve_image_urls(session: aiohttp.ClientSession, messages: list[dic
                 location_to_idx[(msg_idx, part_idx)] = task_idx
                 new_content.append(part)
             elif url.startswith("data:"):
+                normalized = _normalize_data_url(url)
+                invalid = _validate_data_url(normalized)
+                if invalid is not None:
+                    logger.warning(
+                        "Rejected inline image data URL (%d chars): %s", len(url), invalid
+                    )
+                    return new_messages, _build_invalid_image_error(
+                        f"Inline base64 image is not a valid or complete image ({invalid}). "
+                        "Please check the image data."
+                    )
                 new_part = dict(part)
                 new_part["image_url"] = dict(image_url_data)
-                new_part["image_url"]["url"] = _normalize_data_url(url)
+                new_part["image_url"]["url"] = normalized
                 new_content.append(new_part)
             else:
                 new_content.append(part)
@@ -379,14 +453,19 @@ async def _resolve_image_urls(session: aiohttp.ClientSession, messages: list[dic
         new_messages.append(new_msg)
 
     if not download_tasks:
-        return new_messages
+        return new_messages, None
 
     results = await asyncio.gather(*download_tasks)
 
     for (msg_idx, part_idx), task_idx in location_to_idx.items():
+        resolved_url, invalid = results[task_idx]
+        if invalid is not None:
+            return new_messages, _build_invalid_image_error(
+                f"Image from {resolved_url} is not a valid or complete image ({invalid})."
+            )
         new_msg = new_messages[msg_idx]
         new_part = new_msg["content"][part_idx]
         new_part["image_url"] = dict(new_part.get("image_url") or {})
-        new_part["image_url"]["url"] = results[task_idx]
+        new_part["image_url"]["url"] = resolved_url
 
-    return new_messages
+    return new_messages, None

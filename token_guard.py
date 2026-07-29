@@ -59,7 +59,10 @@ class TokenGuard:
 
         if chat_flag and self._session:
             messages_list = body.get("messages") or []
-            body["messages"] = await _resolve_image_urls(self._session, messages_list)
+            body["messages"], image_error = await _resolve_image_urls(self._session, messages_list)
+            if image_error is not None:
+                logger.info("Rejected request: invalid or incomplete image content")
+                return TokenGuardResult(input_tokens=0, error=image_error)
 
         if self._reject_multimedia and chat_flag:
             multimedia_items = _extract_multimedia_info(body["messages"])
