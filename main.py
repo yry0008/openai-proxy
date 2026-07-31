@@ -11,6 +11,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
+from model_map import load_model_map
 import orjson
 
 import asyncio
@@ -26,6 +27,8 @@ dotenv.load_dotenv()
 TARGET_SERVER = os.getenv("TARGET_SERVER", "https://api.openai.com")
 STRIP_V1_PREFIX = os.getenv("STRIP_V1_PREFIX", "0") == "1"
 MODEL_NAME = os.getenv("MODEL_NAME", "")
+# 模型映射: {"客户端请求模型": "上游实际模型"}，MODEL_NAME 优先级更高（设置后强制覆盖所有模型）
+MODEL_MAP = load_model_map(os.getenv("MODEL_MAP", ""))
 API_KEY = os.getenv("API_KEY", "")
 parsed_target = urlparse(TARGET_SERVER)
 TARGET_HOST = parsed_target.netloc
@@ -332,7 +335,13 @@ async def chat_completions(req:dict,request: Request):
 
         client_wants_stream = body.get("stream", False)
         original_model = body.get("model", "")
-        body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
+        if MODEL_NAME:
+            body["model"] = MODEL_NAME
+        elif original_model:
+            upstream_model = MODEL_MAP.get(original_model, original_model)
+            if upstream_model != original_model:
+                logger.info(f"Model mapped: {original_model} -> {upstream_model}")
+            body["model"] = upstream_model
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
         
