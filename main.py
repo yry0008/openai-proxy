@@ -167,6 +167,30 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
+def _is_done_event(chunk: bytes) -> bool:
+    """判断一个 SSE 事件是否包含真正的 ``data: [DONE]`` 行。
+
+    逐行精确匹配，避免 chunk 内 JSON 内容里出现 "[DONE]" 字样时误判。
+    """
+    for line in chunk.split(b"\n"):
+        if line.strip() in (b"data: [DONE]", b"data:[DONE]"):
+            return True
+    return False
+
+async def ensure_done_sentinel(stream):
+    """
+    包装 SSE 流：若流正常结束但上游未发送 data: [DONE]，则补发一个。
+    异常中断或客户端断开时不会补发（异常/取消会直接中断迭代）。
+    """
+    done_seen = False
+    async for chunk in stream:
+        if not done_seen and _is_done_event(chunk):
+            done_seen = True
+        yield chunk
+    if not done_seen:
+        logger.info("Stream ended normally without [DONE], appending 'data: [DONE]' to client.")
+        yield b"data: [DONE]\n\n"
+
 def _make_model_replace_hook(original_model: str):
     """创建 SSE chunk hook，将上游响应中顶层 model 字段替换为客户端请求的原始模型名称。"""
     def hook(event: bytes) -> bytes:
@@ -386,12 +410,14 @@ async def chat_completions(req:dict,request: Request):
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
         if client_wants_stream:
             return StreamingResponse(
-                transform_sse_stream(
-                    proxy_client.stream_generator(
-                        req_id,
-                        chunk_hook=_make_model_replace_hook(original_model) if original_model else None
-                    ),
-                    is_streaming=True
+                ensure_done_sentinel(
+                    transform_sse_stream(
+                        proxy_client.stream_generator(
+                            req_id,
+                            chunk_hook=_make_model_replace_hook(original_model) if original_model else None
+                        ),
+                        is_streaming=True
+                    )
                 ),
                 media_type="text/event-stream",
                 headers={
