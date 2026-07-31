@@ -185,7 +185,15 @@ async def transform_sse_stream(
                 content = delta.get("content")
 
                 if content is None or content == "":
-                    yield chunk
+                    # 删除上游透传的 reasoning / reasoning_content 字段
+                    if "reasoning" in delta or "reasoning_content" in delta:
+                        data["choices"][0]["delta"] = {
+                            k: v for k, v in delta.items()
+                            if k not in ("reasoning", "reasoning_content")
+                        }
+                        yield b"data: " + orjson.dumps(data) + b"\n\n"
+                    else:
+                        yield chunk
                     continue
 
                 parts = extractor.process_content_for_streaming(content)
@@ -198,6 +206,7 @@ async def transform_sse_stream(
                     part_delta = part_data["choices"][0]["delta"]
                     part_delta["content"] = content_before
                     part_delta.pop("reasoning_content", None)
+                    part_delta.pop("reasoning", None)
                     yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
                 if reasoning:
@@ -205,6 +214,7 @@ async def transform_sse_stream(
                     part_delta = part_data["choices"][0]["delta"]
                     part_delta["content"] = None # 显示None，即使没有数据也要 None
                     part_delta["reasoning_content"] = reasoning
+                    part_delta.pop("reasoning", None)
                     yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
                 if content_after:
@@ -212,6 +222,7 @@ async def transform_sse_stream(
                     part_delta = part_data["choices"][0]["delta"]
                     part_delta["content"] = content_after
                     part_delta.pop("reasoning_content", None)
+                    part_delta.pop("reasoning", None)
                     yield b"data: " + orjson.dumps(part_data) + b"\n\n"
 
         else:
