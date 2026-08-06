@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import aiohttp
 import os
 import json
+import secrets
 from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect  # 新增依赖
@@ -169,8 +170,8 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
-def _make_model_replace_hook(original_model: str):
-    """创建 SSE chunk hook，将上游响应中顶层 model 字段替换为客户端请求的原始模型名称。"""
+def _make_chat_completion_hook(original_model: str, response_id: str):
+    """创建 SSE chunk hook，替换上游响应中的 id 和 model 字段。"""
     def hook(event: bytes) -> bytes:
         lines = event.split(b"\n")
         result = []
@@ -184,10 +185,17 @@ def _make_model_replace_hook(original_model: str):
                 continue
             try:
                 data = orjson.loads(payload)
-                if isinstance(data, dict) and "model" in data:
-                    data["model"] = original_model
-                    result.append(b"data: " + orjson.dumps(data))
-                    continue
+                if isinstance(data, dict):
+                    changed = False
+                    if "id" in data:
+                        data["id"] = response_id
+                        changed = True
+                    if original_model and "model" in data:
+                        data["model"] = original_model
+                        changed = True
+                    if changed:
+                        result.append(b"data: " + orjson.dumps(data))
+                        continue
             except (orjson.JSONDecodeError, ValueError):
                 pass
             result.append(line)
@@ -335,6 +343,7 @@ async def chat_completions(req:dict,request: Request):
 
         client_wants_stream = body.get("stream", False)
         original_model = body.get("model", "")
+        response_id = secrets.token_hex(16)
         if MODEL_NAME:
             body["model"] = MODEL_NAME
         elif original_model:
@@ -392,7 +401,7 @@ async def chat_completions(req:dict,request: Request):
             return StreamingResponse(
                 proxy_client.stream_generator(
                     req_id,
-                    chunk_hook=_make_model_replace_hook(original_model) if original_model else None
+                    chunk_hook=_make_chat_completion_hook(original_model, response_id)
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -409,14 +418,20 @@ async def chat_completions(req:dict,request: Request):
                 return b"".join(chunks)
             
             full_body = await collect_response()
-            if original_model:
-                try:
-                    resp_data = orjson.loads(full_body)
-                    if isinstance(resp_data, dict) and "model" in resp_data:
+            try:
+                resp_data = orjson.loads(full_body)
+                if isinstance(resp_data, dict):
+                    changed = False
+                    if "id" in resp_data:
+                        resp_data["id"] = response_id
+                        changed = True
+                    if original_model and "model" in resp_data:
                         resp_data["model"] = original_model
+                        changed = True
+                    if changed:
                         full_body = orjson.dumps(resp_data)
-                except Exception:
-                    pass
+            except Exception:
+                pass
             return Response(content=full_body, media_type="application/json")
 
     except HttpErrorWithContent:
