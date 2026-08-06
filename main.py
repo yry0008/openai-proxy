@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import aiohttp
 import os
 import json
+import secrets
 from urllib.parse import urlparse, urljoin
 from starlette.datastructures import MutableHeaders
 from websockets import connect as websocket_connect
@@ -257,7 +258,7 @@ async def stream_generator(response: aiohttp.ClientResponse,raw_request:Request)
 async def on_first_chunk_callback(request_id:str, ttft:float, data:None):
     logger.info(f"First chunk for request {request_id} received in {ttft:.2f} seconds.")
 
-def _make_model_replace_hook(original_model: str, is_vllm: bool = False):
+def _make_model_replace_hook(original_model: str, response_id: str, is_vllm: bool = False):
     def hook(event: bytes) -> bytes:
         lines = event.split(b"\n")
         result = []
@@ -273,6 +274,9 @@ def _make_model_replace_hook(original_model: str, is_vllm: bool = False):
                 data = orjson.loads(payload)
                 modified = False
                 if isinstance(data, dict):
+                    if "id" in data:
+                        data["id"] = response_id
+                        modified = True
                     if original_model and "model" in data:
                         data["model"] = original_model
                         modified = True
@@ -452,6 +456,7 @@ async def chat_completions(req:dict,request: Request):
 
         client_wants_stream = body.get("stream", False)
         original_model = body.get("model", "")
+        response_id = secrets.token_hex(16)
         body["model"] = MODEL_NAME if MODEL_NAME else body.get("model", "")
         if body.get("model") is None or body.get("model") == "":
             raise HTTPException(status_code=400, detail="Model name is required but not provided.")
@@ -533,11 +538,10 @@ async def chat_completions(req:dict,request: Request):
 
         # 3. 只有当 wait_for_upstream_status 成功通过（即 Status 200），才建立流式响应
         if client_wants_stream:
-            needs_hook = bool(original_model) or IS_VLLM
             return StreamingResponse(
                 proxy_client.stream_generator(
                     req_id,
-                    chunk_hook=_make_model_replace_hook(original_model, is_vllm=IS_VLLM) if needs_hook else None
+                    chunk_hook=_make_model_replace_hook(original_model, response_id, is_vllm=IS_VLLM)
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -558,6 +562,9 @@ async def chat_completions(req:dict,request: Request):
                 resp_data = orjson.loads(full_body)
                 if isinstance(resp_data, dict):
                     modified = False
+                    if "id" in resp_data:
+                        resp_data["id"] = response_id
+                        modified = True
                     if original_model and "model" in resp_data:
                         resp_data["model"] = original_model
                         modified = True
