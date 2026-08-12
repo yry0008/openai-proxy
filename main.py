@@ -478,10 +478,26 @@ async def chat_completions(req:dict,request: Request):
         # 顶层 enable_thinking（阿里/Qwen 规范），优先级低于 thinking dict
         if enable_thinking is None and "enable_thinking" in body:
             enable_thinking = bool(body["enable_thinking"])
+
+        if REASONING_TYPE == "glm":
+            reasoning_effort = body.get("reasoning_effort", None)
+            if reasoning_effort is not None:
+                reasoning_effort = str(reasoning_effort).lower()
+                if reasoning_effort == "none":
+                    enable_thinking = False
+                    del body["reasoning_effort"]
+                elif reasoning_effort in ("max","xhigh","ultra"):
+                    enable_thinking = True
+                    body["reasoning_effort"] = "max"
+                else:
+                    enable_thinking = True
+                    body["reasoning_effort"] = "high"
+                        
         # 写入 SGLang 格式
         if enable_thinking is not None:
             chat_template_kwargs = body.setdefault("chat_template_kwargs", {})
             chat_template_kwargs["enable_thinking"] = enable_thinking
+            chat_template_kwargs["thinking"] = enable_thinking  # 兼容部分模型使用 thinking 字段
         # 消费后删除，避免透传到上游引发不兼容
         body.pop("thinking", None)
         body.pop("enable_thinking", None)
