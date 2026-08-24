@@ -478,6 +478,9 @@ async def chat_completions(req:dict,request: Request):
         # 顶层 enable_thinking（阿里/Qwen 规范），优先级低于 thinking dict
         if enable_thinking is None and "enable_thinking" in body:
             enable_thinking = bool(body["enable_thinking"])
+        # thinking still none, set to true
+        if enable_thinking is None:
+            enable_thinking = True
 
         if REASONING_TYPE == "glm":
             reasoning_effort = body.get("reasoning_effort", None)
