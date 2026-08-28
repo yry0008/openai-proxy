@@ -6,11 +6,18 @@ inline base64 images are rejected instead of being forwarded upstream.
 """
 import base64
 import io
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from multimedia import _resolve_image_urls, _normalize_data_url
+from multimedia import (
+    _convert_video_urls_to_images,
+    _normalize_data_url,
+    _resolve_image_urls,
+)
 
 
 def _make_valid_png() -> bytes:
@@ -34,6 +41,17 @@ def _image_message(url: str) -> list[dict]:
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": url}},
+            ],
+        }
+    ]
+
+
+def _video_message(url: str) -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": url}},
             ],
         }
     ]
@@ -174,6 +192,71 @@ class TestRemoteImageUrlRejected:
         result, err = await _resolve_image_urls(messages)
         assert err is not None
         assert "Remote image URL is not supported" in err["error"]["message"]
+
+
+class TestRemoteVideoUrlRejected:
+    @pytest.mark.asyncio
+    async def test_http_url_rejected(self):
+        url = "http://example.com/video.mp4"
+        result, err = await _resolve_image_urls(_video_message(url))
+        assert err is not None
+        assert err["error"]["type"] == "invalid_request_error"
+        assert "Remote video URL is not supported" in err["error"]["message"]
+        assert url in err["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_https_url_rejected(self):
+        url = "https://example.com/video.mp4"
+        result, err = await _resolve_image_urls(_video_message(url))
+        assert err is not None
+        assert err["error"]["type"] == "invalid_request_error"
+        assert "Remote video URL is not supported" in err["error"]["message"]
+        assert url in err["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_data_url_accepted(self):
+        url = "data:video/mp4;base64,AAAA"
+        result, err = await _resolve_image_urls(_video_message(url))
+        assert err is None
+        assert result[0]["content"][0]["video_url"]["url"] == url
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+class TestVideoFrameExtraction:
+    @pytest.mark.asyncio
+    async def test_one_frame_per_second_replaces_video_part(self, tmp_path: Path):
+        video_path = tmp_path / "input.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=red:s=32x32:r=1:d=3",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video_path),
+            ],
+            check=True,
+        )
+        video_url = "data:video/mp4;base64," + base64.b64encode(video_path.read_bytes()).decode("ascii")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "video_url", "video_url": {"url": video_url}},
+                {"type": "text", "text": "in detail"},
+            ],
+        }]
+
+        result, err = await _convert_video_urls_to_images(
+            messages,
+            ffmpeg_bin=shutil.which("ffmpeg") or "ffmpeg",
+            max_dimension=32,
+            timeout=15,
+        )
+
+        assert err is None
+        content = result[0]["content"]
+        assert [part["type"] for part in content] == [
+            "text", "image_url", "image_url", "image_url", "text",
+        ]
+        assert all(part["image_url"]["url"].startswith("data:image/jpeg;base64,") for part in content[1:4])
 
 
 class TestImageValidation:

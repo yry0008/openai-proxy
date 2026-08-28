@@ -12,8 +12,7 @@ from fastapi.responses import Response, StreamingResponse, ORJSONResponse
 from fastapi.websockets import WebSocket
 from http_client import  RequestWrapper, RequestResult, RequestStatus, HttpErrorWithContent, CancelBehavior
 from sse_proxy_client import SseProxyClient
-from tokenizer import HAS_TOKENIZER, _resolve_model_max_context
-from token_guard import TokenGuard
+from multimedia import _convert_video_urls_to_images, _resolve_image_urls
 import orjson
 
 import asyncio
@@ -39,10 +38,6 @@ RETRY_INTERVAL = float(os.getenv("RETRY_INTERVAL", 0.5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 CUSTOM_USER_AGENT = os.getenv("CUSTOM_USER_AGENT", "")
 
-MODEL_ID = os.getenv("MODEL_ID", "").strip()
-MODEL_MAX_CONTEXT = int(os.getenv("MODEL_MAX_CONTEXT", "0"))
-
-
 def _parse_model_context_limits(raw: str) -> dict:
     """Parse MODEL_CONTEXT_LIMITS as a JSON object mapping model name to max context tokens."""
     if not raw.strip():
@@ -67,27 +62,21 @@ def _parse_model_context_limits(raw: str) -> dict:
     return limits
 
 
-MODEL_CONTEXT_LIMITS = _parse_model_context_limits(os.getenv("MODEL_CONTEXT_LIMITS", ""))
 REASONING_TYPE = os.getenv("REASONING_TYPE", "").strip()
 IS_VLLM = os.getenv("IS_VLLM", "false").strip().lower() in ("true", "1", "yes")
-REJECT_MULTIMEDIA = os.getenv("REJECT_MULTIMEDIA", "false").strip().lower() in ("true", "1", "yes")
-VL_TOKEN_STRATEGY = os.getenv("VL_TOKEN_STRATEGY", "").strip().lower()
-VL_CONFIG = {
-    "strategy": VL_TOKEN_STRATEGY,
-    "patch_size": int(os.getenv("VL_PATCH_SIZE", "16")),
-    "merge_size": int(os.getenv("VL_MERGE_SIZE", "2")),
-    "temporal_patch_size": int(os.getenv("VL_TEMPORAL_PATCH_SIZE", "2")),
-    "min_pixels": int(os.getenv("VL_MIN_PIXELS", "4096")),
-    "max_pixels": int(os.getenv("VL_MAX_PIXELS", str(16384 * 32 * 32))),
-    "image_size": int(os.getenv("VL_IMAGE_SIZE", "448")),
-    "max_image_tokens": int(os.getenv("VL_MAX_IMAGE_TOKENS", "2048")),
-}
+VIDEO_FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+VIDEO_FPS = float(os.getenv("VIDEO_FPS", "1"))
+VIDEO_MAX_FRAMES = int(os.getenv("VIDEO_MAX_FRAMES", "120"))
+VIDEO_MAX_DIMENSION = int(os.getenv("VIDEO_MAX_DIMENSION", "768"))
+VIDEO_JPEG_QUALITY = int(os.getenv("VIDEO_JPEG_QUALITY", "5"))
+VIDEO_CONVERSION_TIMEOUT = float(os.getenv("VIDEO_CONVERSION_TIMEOUT", "60"))
+VIDEO_CONVERSION_CONCURRENCY = max(1, int(os.getenv("VIDEO_CONVERSION_CONCURRENCY", "2")))
 
 client_session: aiohttp.ClientSession = None
 
 proxy_client: SseProxyClient = None
 
-token_guard: TokenGuard = None
+video_conversion_semaphore = asyncio.Semaphore(VIDEO_CONVERSION_CONCURRENCY)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -99,62 +88,15 @@ async def lifespan(app: FastAPI):
 async def startup():
     global client_session
     global proxy_client
-    global token_guard
     logger.info("Starting up and creating aiohttp.ClientSession...")
     client_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(connect=10))
     proxy_client = SseProxyClient()
     logger.info("SseProxyClient started.")
-
-    batch_tokenizer = None
-    model_max_context = None
-
-    if MODEL_ID and HAS_TOKENIZER:
-        from transformers import AutoTokenizer
-        from tokenizer import AsyncBatchTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, trust_remote_code=True)
-        if tokenizer.chat_template is not None:
-            if MODEL_MAX_CONTEXT > 0:
-                model_max_context = MODEL_MAX_CONTEXT
-            else:
-                model_max_context = _resolve_model_max_context(MODEL_ID, tokenizer)
-            batch_tokenizer = AsyncBatchTokenizer(tokenizer)
-            await batch_tokenizer.start()
-            logger.info(f"Loaded tokenizer for {MODEL_ID} — using accurate token counting for chat requests")
-            if model_max_context is not None:
-                logger.info(f"Model max context length: {model_max_context}")
-            else:
-                logger.warning("Failed to resolve model context length. Context-length guard is disabled.")
-        else:
-            logger.warning(f"Tokenizer for {MODEL_ID} has no chat_template. Falling back to byte-length estimation.")
-    elif MODEL_ID and not HAS_TOKENIZER:
-        logger.warning("MODEL_ID set but transformers not installed. Falling back to byte-length estimation.")
-    else:
-        logger.info("No MODEL_ID set. Using byte-length estimation for token counting.")
-
-    token_guard = TokenGuard(
-        batch_tokenizer=batch_tokenizer,
-        model_max_context=model_max_context,
-        reasoning_type=REASONING_TYPE,
-        reject_multimedia=REJECT_MULTIMEDIA,
-        vl_config=VL_CONFIG,
-        model_context_limits=MODEL_CONTEXT_LIMITS,
-    )
-
-    if MODEL_CONTEXT_LIMITS:
-        logger.info(f"Model-specific context limits: {MODEL_CONTEXT_LIMITS}")
-
-    logger.info(f"Reject multimedia: {REJECT_MULTIMEDIA}")
     logger.info(f"IS_VLLM: {IS_VLLM}")
-    if VL_TOKEN_STRATEGY and VL_TOKEN_STRATEGY != "none":
-        logger.info(f"VL token estimation strategy: {VL_TOKEN_STRATEGY}")
-    else:
-        logger.info("VL token estimation: disabled")
 
 async def shutdown():
     global client_session
     global proxy_client
-    if token_guard and token_guard.batch_tokenizer:
-        await token_guard.batch_tokenizer.stop()
     if client_session:
         logger.info("Shutting down aiohttp.ClientSession...")
         await client_session.close()
@@ -507,9 +449,24 @@ async def chat_completions(req:dict,request: Request):
         if IS_VLLM:
             _convert_vllm_request_reasoning(body)
 
-        guard_result = await token_guard.check(body, body_bytes, model=original_model)
-        if guard_result.error:
-            return ORJSONResponse(status_code=400, content=guard_result.error)
+        if "messages" in body and isinstance(body.get("messages"), list):
+            body["messages"], image_error = await _resolve_image_urls(body["messages"])
+            if image_error is not None:
+                logger.info("Rejected request: invalid or incomplete multimedia content")
+                return ORJSONResponse(status_code=400, content=image_error)
+            async with video_conversion_semaphore:
+                body["messages"], video_error = await _convert_video_urls_to_images(
+                    body["messages"],
+                    ffmpeg_bin=VIDEO_FFMPEG_BIN,
+                    fps=VIDEO_FPS,
+                    max_frames=VIDEO_MAX_FRAMES,
+                    max_dimension=VIDEO_MAX_DIMENSION,
+                    jpeg_quality=VIDEO_JPEG_QUALITY,
+                    timeout=VIDEO_CONVERSION_TIMEOUT,
+                )
+            if video_error is not None:
+                logger.info("Rejected request: video frame extraction failed")
+                return ORJSONResponse(status_code=400, content=video_error)
 
         if client_wants_stream:
             on_stream_start_callback = on_first_chunk_callback

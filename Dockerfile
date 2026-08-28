@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # 安装系统依赖
-RUN apk add --no-cache gcc musl-dev libffi-dev curl
+RUN apk add --no-cache gcc musl-dev libffi-dev curl ffmpeg
 
 # 复制依赖文件
 COPY requirements.txt .

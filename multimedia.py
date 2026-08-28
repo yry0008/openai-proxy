@@ -1,10 +1,13 @@
 """Multimedia-related functions for handling images, videos, and audio in messages."""
 
+import asyncio
 import base64
 import logging
 import math
 import re
+import tempfile
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional
 
 try:
@@ -23,6 +26,8 @@ __all__ = [
     "_extract_multimedia_info",
     "_estimate_multimedia_tokens",
     "_resolve_image_urls",
+    "_extract_video_frames",
+    "_convert_video_urls_to_images",
     "_normalize_data_url",
     "_validate_image_bytes",
     "_validate_data_url",
@@ -93,6 +98,176 @@ def _validate_data_url(url: str) -> Optional[str]:
 
 def _build_invalid_image_error(message: str) -> dict:
     return {"error": {"message": message, "type": "invalid_request_error"}}
+
+
+def _decode_video_data_url(url: str) -> tuple[bytes | None, str | None]:
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None, "video_url must be a base64 data URL."
+
+    match = _DATA_URL_RE.match(url)
+    if not match:
+        return None, "video_url must be a base64 data URL (data:video/<type>;base64,<data>)."
+
+    mime, b64_data = match.groups()
+    if not mime.lower().startswith("video/"):
+        return None, f"Unsupported video data URL MIME type: {mime}."
+    try:
+        raw = base64.b64decode(b64_data, validate=True)
+    except Exception as e:
+        return None, f"invalid base64 payload: {e}"
+    if not raw:
+        return None, "empty video data"
+    return raw, None
+
+
+async def _extract_video_frames(
+    video_url: str,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    fps: float = 1.0,
+    max_frames: int | None = 120,
+    max_dimension: int = 768,
+    jpeg_quality: int = 5,
+    timeout: float = 60.0,
+) -> tuple[list[str], str | None]:
+    """Extract JPEG data URLs from a base64 video URL at a fixed frame rate."""
+    video_bytes, decode_error = _decode_video_data_url(video_url)
+    if decode_error is not None:
+        return [], decode_error
+    if fps <= 0:
+        return [], "Video frame rate must be greater than zero."
+    if max_frames is not None and max_frames <= 0:
+        return [], "Video max_frames must be greater than zero."
+    if max_dimension <= 0:
+        return [], "Video max_dimension must be greater than zero."
+
+    filter_graph = (
+        f"fps={fps:g},"
+        f"scale={max_dimension}:{max_dimension}:force_original_aspect_ratio=decrease"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="openai-proxy-video-") as temp_dir:
+        output_pattern = str(Path(temp_dir) / "frame-%06d.jpg")
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-threads", "1",
+            "-i", "pipe:0",
+            "-map", "0:v:0",
+            "-an",
+            "-vf", filter_graph,
+            "-q:v", str(jpeg_quality),
+        ]
+        if max_frames is not None:
+            command.extend(["-frames:v", str(max_frames)])
+        command.extend(["-f", "image2", output_pattern])
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return [], f"FFmpeg executable was not found: {ffmpeg_bin}"
+        except OSError as e:
+            return [], f"Failed to start FFmpeg: {e}"
+
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(video_bytes),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            return [], f"Video frame extraction timed out after {timeout:g} seconds."
+        except Exception as e:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            return [], f"Video frame extraction failed: {e}"
+
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            return [], f"FFmpeg could not decode the video{': ' + detail if detail else '.'}"
+
+        frame_paths = sorted(Path(temp_dir).glob("frame-*.jpg"))
+        if not frame_paths:
+            return [], "FFmpeg produced no video frames."
+
+        frames = []
+        for frame_path in frame_paths:
+            frame_bytes = frame_path.read_bytes()
+            invalid = _validate_image_bytes(frame_bytes)
+            if invalid is not None:
+                return [], f"FFmpeg produced an invalid image frame ({invalid})."
+            frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
+            frames.append(f"data:image/jpeg;base64,{frame_b64}")
+        return frames, None
+
+
+async def _convert_video_urls_to_images(
+    messages: list[dict],
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    fps: float = 1.0,
+    max_frames: int | None = 120,
+    max_dimension: int = 768,
+    jpeg_quality: int = 5,
+    timeout: float = 60.0,
+) -> tuple[list[dict], Optional[dict]]:
+    """Replace data URL video parts with one image part per extracted frame."""
+    new_messages = []
+    for msg in messages:
+        new_msg = dict(msg)
+        content = new_msg.get("content")
+        if not isinstance(content, list):
+            new_messages.append(new_msg)
+            continue
+
+        new_content = []
+        for part in content:
+            if not isinstance(part, dict) or str(part.get("type") or "").lower() != "video_url":
+                new_content.append(part)
+                continue
+
+            video_url_data = part.get("video_url")
+            if not isinstance(video_url_data, dict):
+                new_content.append(part)
+                continue
+            url = video_url_data.get("url") or ""
+            if not isinstance(url, str) or not url.startswith("data:"):
+                new_content.append(part)
+                continue
+
+            frame_urls, extraction_error = await _extract_video_frames(
+                url,
+                ffmpeg_bin=ffmpeg_bin,
+                fps=fps,
+                max_frames=max_frames,
+                max_dimension=max_dimension,
+                jpeg_quality=jpeg_quality,
+                timeout=timeout,
+            )
+            if extraction_error is not None:
+                logger.warning("Failed to extract video frames: %s", extraction_error)
+                return new_messages, _build_invalid_image_error(
+                    f"Video could not be converted to image frames ({extraction_error})."
+                )
+            new_content.extend(
+                {"type": "image_url", "image_url": {"url": frame_url}}
+                for frame_url in frame_urls
+            )
+
+        new_msg["content"] = new_content
+        new_messages.append(new_msg)
+
+    return new_messages, None
 
 
 def _smart_resize(
@@ -356,11 +531,11 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
 async def _resolve_image_urls(
     messages: list[dict],
 ) -> tuple[list[dict], Optional[dict]]:
-    """Validate image URLs in messages; only base64 data URLs are accepted.
+    """Validate image and video URLs in message content.
 
-    Returns (messages, error). error is None when every image is usable;
+    Returns (messages, error). error is None when every media part is usable;
     otherwise it is a 400 error body to return to the client. Remote
-    http(s) image URLs are rejected — clients must send base64 data URLs.
+    http(s) image and video URLs are rejected — clients must send data URLs.
     """
     new_messages = []
     for msg in messages:
@@ -371,24 +546,36 @@ async def _resolve_image_urls(
             continue
         new_content = []
         for part in content:
-            if not isinstance(part, dict) or str(part.get("type") or "").lower() != "image_url":
+            if not isinstance(part, dict):
                 new_content.append(part)
                 continue
-            image_url_data = part.get("image_url")
-            if not isinstance(image_url_data, dict):
+
+            part_type = str(part.get("type") or "").lower()
+            if part_type == "image_url":
+                url_field = "image_url"
+                media_name = "image"
+            elif part_type == "video_url":
+                url_field = "video_url"
+                media_name = "video"
+            else:
                 new_content.append(part)
                 continue
-            url = image_url_data.get("url") or ""
-            if url.startswith("http://") or url.startswith("https://"):
-                logger.warning("Rejected remote image URL: %s", url)
+
+            media_url_data = part.get(url_field)
+            if not isinstance(media_url_data, dict):
+                new_content.append(part)
+                continue
+            url = media_url_data.get("url") or ""
+            if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
+                logger.warning("Rejected remote %s URL: %s", media_name, url)
                 return new_messages, _build_invalid_image_error(
-                    f"Remote image URL is not supported ({url}). "
-                    "image_url must be a base64 data URL "
-                    "(data:image/<type>;base64,<data>)."
+                    f"Remote {media_name} URL is not supported ({url}). "
+                    f"{url_field} must be a base64 data URL "
+                    f"(data:{media_name}/<type>;base64,<data>)."
                 )
-            elif url.startswith("data:"):
+            elif isinstance(url, str) and url.startswith("data:"):
                 normalized = _normalize_data_url(url)
-                invalid = _validate_data_url(normalized)
+                invalid = _validate_data_url(normalized) if media_name == "image" else None
                 if invalid is not None:
                     logger.warning(
                         "Rejected inline image data URL (%d chars): %s", len(url), invalid
@@ -398,8 +585,8 @@ async def _resolve_image_urls(
                         "Please check the image data."
                     )
                 new_part = dict(part)
-                new_part["image_url"] = dict(image_url_data)
-                new_part["image_url"]["url"] = normalized
+                new_part[url_field] = dict(media_url_data)
+                new_part[url_field]["url"] = normalized
                 new_content.append(new_part)
             else:
                 new_content.append(part)
