@@ -1,15 +1,11 @@
 """Multimedia-related functions for handling images, videos, and audio in messages."""
 
-import asyncio
 import base64
 import logging
 import math
-import mimetypes
 import re
 from io import BytesIO
 from typing import Any, Optional
-
-import aiohttp
 
 try:
     from PIL import Image as _pil_image
@@ -26,7 +22,6 @@ __all__ = [
     "_strip_multimedia_from_messages",
     "_extract_multimedia_info",
     "_estimate_multimedia_tokens",
-    "_download_image_as_base64",
     "_resolve_image_urls",
     "_normalize_data_url",
     "_validate_image_bytes",
@@ -358,67 +353,24 @@ def _estimate_multimedia_tokens(items: list[dict], config: dict) -> int:
     return total
 
 
-async def _download_image_as_base64(
-    session: aiohttp.ClientSession, url: str
-) -> tuple[str, Optional[str]]:
-    """Download an image and return (data_url_or_original_url, error_detail).
-
-    error_detail is set when the downloaded bytes fail image validation
-    (truncated/corrupt); the request should be rejected in that case.
-    """
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            if response.status != 200:
-                logger.warning(
-                    "Failed to download image from %s: status %d", url, response.status
-                )
-                return url, None
-
-            content_type = response.headers.get("content-type", "")
-            if not content_type or not content_type.startswith("image/"):
-                guessed, _ = mimetypes.guess_type(url)
-                if guessed and guessed.startswith("image/"):
-                    content_type = guessed
-                else:
-                    content_type = "image/png"
-
-            content = await response.read()
-            invalid = _validate_image_bytes(content)
-            if invalid is not None:
-                logger.warning(
-                    "Invalid image downloaded from %s (%d bytes): %s",
-                    url, len(content), invalid,
-                )
-                return url, invalid
-
-            ext = content_type.split("/")[-1] if "/" in content_type else "png"
-            b64 = base64.b64encode(content).decode("utf-8")
-            return f"data:image/{ext};base64,{b64}", None
-    except Exception as e:
-        logger.warning("Failed to download image from %s: %s", url, e)
-        return url, None
-
-
 async def _resolve_image_urls(
-    session: aiohttp.ClientSession, messages: list[dict]
+    messages: list[dict],
 ) -> tuple[list[dict], Optional[dict]]:
-    """Resolve image URLs in messages to base64 data URLs, validating integrity.
+    """Validate image URLs in messages; only base64 data URLs are accepted.
 
     Returns (messages, error). error is None when every image is usable;
-    otherwise it is a 400 error body to return to the client.
+    otherwise it is a 400 error body to return to the client. Remote
+    http(s) image URLs are rejected — clients must send base64 data URLs.
     """
-    download_tasks = []
-    location_to_idx = {}
-
     new_messages = []
-    for msg_idx, msg in enumerate(messages):
+    for msg in messages:
         new_msg = dict(msg)
         content = new_msg.get("content")
         if not isinstance(content, list):
             new_messages.append(new_msg)
             continue
         new_content = []
-        for part_idx, part in enumerate(content):
+        for part in content:
             if not isinstance(part, dict) or str(part.get("type") or "").lower() != "image_url":
                 new_content.append(part)
                 continue
@@ -428,10 +380,12 @@ async def _resolve_image_urls(
                 continue
             url = image_url_data.get("url") or ""
             if url.startswith("http://") or url.startswith("https://"):
-                task_idx = len(download_tasks)
-                download_tasks.append(_download_image_as_base64(session, url))
-                location_to_idx[(msg_idx, part_idx)] = task_idx
-                new_content.append(part)
+                logger.warning("Rejected remote image URL: %s", url)
+                return new_messages, _build_invalid_image_error(
+                    f"Remote image URL is not supported ({url}). "
+                    "image_url must be a base64 data URL "
+                    "(data:image/<type>;base64,<data>)."
+                )
             elif url.startswith("data:"):
                 normalized = _normalize_data_url(url)
                 invalid = _validate_data_url(normalized)
@@ -451,21 +405,5 @@ async def _resolve_image_urls(
                 new_content.append(part)
         new_msg["content"] = new_content
         new_messages.append(new_msg)
-
-    if not download_tasks:
-        return new_messages, None
-
-    results = await asyncio.gather(*download_tasks)
-
-    for (msg_idx, part_idx), task_idx in location_to_idx.items():
-        resolved_url, invalid = results[task_idx]
-        if invalid is not None:
-            return new_messages, _build_invalid_image_error(
-                f"Image from {resolved_url} is not a valid or complete image ({invalid})."
-            )
-        new_msg = new_messages[msg_idx]
-        new_part = new_msg["content"][part_idx]
-        new_part["image_url"] = dict(new_part.get("image_url") or {})
-        new_part["image_url"]["url"] = resolved_url
 
     return new_messages, None

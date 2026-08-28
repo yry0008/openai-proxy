@@ -137,7 +137,6 @@ async def startup():
         reasoning_type=REASONING_TYPE,
         reject_multimedia=REJECT_MULTIMEDIA,
         vl_config=VL_CONFIG,
-        aiohttp_session=client_session,
         model_context_limits=MODEL_CONTEXT_LIMITS,
     )
 

@@ -19,8 +19,6 @@ from utils import (
     _build_context_length_error,
 )
 
-import aiohttp
-
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +36,6 @@ class TokenGuard:
         reasoning_type: str,
         reject_multimedia: bool,
         vl_config: dict,
-        aiohttp_session: aiohttp.ClientSession | None = None,
         model_context_limits: dict | None = None,
     ):
         self._batch_tokenizer = batch_tokenizer
@@ -48,7 +45,6 @@ class TokenGuard:
         self._reject_multimedia = reject_multimedia
         self._vl_config = vl_config
         self._vl_strategy = vl_config.get("strategy", "")
-        self._session = aiohttp_session
 
     @property
     def batch_tokenizer(self) -> AsyncBatchTokenizer | None:
@@ -57,9 +53,9 @@ class TokenGuard:
     async def check(self, body: dict, body_bytes: bytes, model: str = "") -> TokenGuardResult:
         chat_flag = "messages" in body
 
-        if chat_flag and self._session:
+        if chat_flag:
             messages_list = body.get("messages") or []
-            body["messages"], image_error = await _resolve_image_urls(self._session, messages_list)
+            body["messages"], image_error = await _resolve_image_urls(messages_list)
             if image_error is not None:
                 logger.info("Rejected request: invalid or incomplete image content")
                 return TokenGuardResult(input_tokens=0, error=image_error)
