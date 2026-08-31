@@ -147,6 +147,11 @@ async def _extract_video_frames(
     )
 
     with tempfile.TemporaryDirectory(prefix="openai-proxy-video-") as temp_dir:
+        # MP4 files may require seeking to their trailing moov atom. A regular
+        # temporary file is therefore more compatible than feeding bytes via
+        # stdin/pipe:0.
+        input_path = Path(temp_dir) / "input.video"
+        await asyncio.to_thread(input_path.write_bytes, video_bytes)
         output_pattern = str(Path(temp_dir) / "frame-%06d.jpg")
         command = [
             ffmpeg_bin,
@@ -154,7 +159,7 @@ async def _extract_video_frames(
             "-loglevel", "error",
             "-y",
             "-threads", "1",
-            "-i", "pipe:0",
+            "-i", str(input_path),
             "-map", "0:v:0",
             "-an",
             "-vf", filter_graph,
@@ -167,7 +172,6 @@ async def _extract_video_frames(
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -178,7 +182,7 @@ async def _extract_video_frames(
 
         try:
             _, stderr = await asyncio.wait_for(
-                process.communicate(video_bytes),
+                process.communicate(),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
