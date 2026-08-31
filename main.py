@@ -78,6 +78,16 @@ proxy_client: SseProxyClient = None
 
 video_conversion_semaphore = asyncio.Semaphore(VIDEO_CONVERSION_CONCURRENCY)
 
+
+def _get_upstream_auth_header(headers) -> str | None:
+    """Prefer the client's Authorization header, falling back to API_KEY."""
+    auth_header = headers.get("Authorization") or headers.get("authorization")
+    if not auth_header:
+        return f"Bearer {API_KEY}" if API_KEY else None
+    if not auth_header.startswith("Bearer "):
+        return "Bearer " + auth_header
+    return auth_header
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await startup()
@@ -131,8 +141,16 @@ async def pass_ws_request(websocket: WebSocket, path: str):
     if websocket.url.query:
         target_ws_url += f"?{websocket.url.query}"
 
-    # 建立到目标服务器的 WebSocket 连接
-    async with websocket_connect(target_ws_url,ssl=False if TARGET_WS_SCHEME == "wss" else None) as target_ws:
+    # 建立到目标服务器的 WebSocket 连接，并透传客户端 API Key
+    target_headers = {}
+    auth_header = _get_upstream_auth_header(websocket.headers)
+    if auth_header:
+        target_headers["Authorization"] = auth_header
+    async with websocket_connect(
+        target_ws_url,
+        ssl=False if TARGET_WS_SCHEME == "wss" else None,
+        additional_headers=target_headers or None,
+    ) as target_ws:
         # 双向数据转发
         while True:
             try:
@@ -601,8 +619,10 @@ async def reverse_proxy(request: Request, path: str):
     # 设置目标服务器信息
     headers["host"] = TARGET_HOST.split('/')[0].split(':')[0]
     
-    # 替换Authorization头为API_KEY
-    headers["authorization"] = f"Bearer {API_KEY}"
+    # 客户端 Authorization 优先透传，没有时才使用配置中的 API_KEY
+    auth_header = _get_upstream_auth_header(request.headers)
+    if auth_header:
+        headers["authorization"] = auth_header
 
     if "content-length" in headers:
         del headers["content-length"]
